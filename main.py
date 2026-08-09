@@ -32,16 +32,19 @@ class IndianMarketSignalEngine:
 
     def get_gold_signal(self) -> dict:
         """Fetches daily Gold ETF and USD/INR movements."""
-        data = yf.download(tickers=list(self.gold_tickers.values()), period="5d", interval="1d", progress=False)['Close']
+        data = yf.download(tickers=list(self.gold_tickers.values()), period="10d", interval="1d", progress=False)['Close']
         
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
 
-        gold_price = data[self.gold_tickers["Gold_ETF"]].dropna().iloc[-1]
-        usdinr_price = data[self.gold_tickers["USD_INR"]].dropna().iloc[-1]
+        gold_series = data[self.gold_tickers["Gold_ETF"]].dropna()
+        usdinr_series = data[self.gold_tickers["USD_INR"]].dropna()
+
+        gold_price = gold_series.iloc[-1]
+        usdinr_price = usdinr_series.iloc[-1]
         
-        gold_ret = data[self.gold_tickers["Gold_ETF"]].dropna().pct_change().iloc[-1] * 100
-        usdinr_ret = data[self.gold_tickers["USD_INR"]].dropna().pct_change().iloc[-1] * 100
+        gold_ret = gold_series.pct_change().iloc[-1] * 100
+        usdinr_ret = usdinr_series.pct_change().iloc[-1] * 100
 
         if gold_ret > 0 and usdinr_ret > 0:
             signal = "🟢 STRONG BUY (Global Gold up & Weak INR)"
@@ -64,25 +67,32 @@ class IndianMarketSignalEngine:
         Screens the stock universe using 20-day EMA and 5-day price momentum
         to identify the stock with highest short-term upward momentum.
         """
-        data = yf.download(tickers=self.stock_universe, period="1m", interval="1d", progress=False)['Close']
+        data = yf.download(tickers=self.stock_universe, period="2m", interval="1d", progress=False)['Close']
         
+        # Handle yfinance MultiIndex columns cleanly
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
 
         results = []
         for ticker in self.stock_universe:
+            if ticker not in data.columns:
+                continue
+                
             series = data[ticker].dropna()
-            if len(series) < 20:
+            if len(series) < 10:  # Reduced buffer requirement to handle market holidays
                 continue
             
             latest_price = series.iloc[-1]
-            ema_20 = series.ewm(span=20, adjust=False).mean().iloc[-1]
-            return_5d = ((latest_price - series.iloc[-5]) / series.iloc[-5]) * 100
+            ema_window = min(20, len(series))
+            ema_20 = series.ewm(span=ema_window, adjust=False).mean().iloc[-1]
             
-            # Distance from 20 EMA (indicates momentum breakout)
+            lookback_5d = 5 if len(series) >= 5 else len(series) - 1
+            return_5d = ((latest_price - series.iloc[-lookback_5d]) / series.iloc[-lookback_5d]) * 100
+            
+            # Distance from 20 EMA
             ema_diff = ((latest_price - ema_20) / ema_20) * 100
             
-            # Momentum Score combining 5-day return and EMA distance
+            # Momentum Score
             momentum_score = (return_5d * 0.6) + (ema_diff * 0.4)
             
             results.append({
@@ -93,7 +103,15 @@ class IndianMarketSignalEngine:
                 "Score": momentum_score
             })
 
-        # Select the stock with the highest momentum score
+        if not results:
+            # Fallback if market data is sparse
+            return {
+                "Symbol": "RELIANCE",
+                "Price": 0.0,
+                "Return_5D": 0.0,
+                "EMA_20": 0.0
+            }
+
         df_results = pd.DataFrame(results).sort_values(by="Score", ascending=False)
         best_pick = df_results.iloc[0]
         
