@@ -67,9 +67,9 @@ class IndianMarketSignalEngine:
         Screens the stock universe using 20-day EMA and 5-day price momentum
         to identify the stock with highest short-term upward momentum.
         """
-        data = yf.download(tickers=self.stock_universe, period="2m", interval="1d", progress=False)['Close']
+        # Fetch 3 months buffer to account for weekends and holidays
+        data = yf.download(tickers=self.stock_universe, period="3m", interval="1d", progress=False)['Close']
         
-        # Handle yfinance MultiIndex columns cleanly
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
 
@@ -79,17 +79,16 @@ class IndianMarketSignalEngine:
                 continue
                 
             series = data[ticker].dropna()
-            if len(series) < 10:  # Reduced buffer requirement to handle market holidays
+            if len(series) < 20:
                 continue
             
             latest_price = series.iloc[-1]
-            ema_window = min(20, len(series))
-            ema_20 = series.ewm(span=ema_window, adjust=False).mean().iloc[-1]
+            ema_20 = series.ewm(span=20, adjust=False).mean().iloc[-1]
             
-            lookback_5d = 5 if len(series) >= 5 else len(series) - 1
-            return_5d = ((latest_price - series.iloc[-lookback_5d]) / series.iloc[-lookback_5d]) * 100
+            # 5 trading days momentum calculation
+            return_5d = ((latest_price - series.iloc[-5]) / series.iloc[-5]) * 100
             
-            # Distance from 20 EMA
+            # Percentage distance from 20-day EMA
             ema_diff = ((latest_price - ema_20) / ema_20) * 100
             
             # Momentum Score
@@ -104,9 +103,8 @@ class IndianMarketSignalEngine:
             })
 
         if not results:
-            # Fallback if market data is sparse
             return {
-                "Symbol": "RELIANCE",
+                "Symbol": "N/A",
                 "Price": 0.0,
                 "Return_5D": 0.0,
                 "EMA_20": 0.0
