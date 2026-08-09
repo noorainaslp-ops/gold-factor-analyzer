@@ -21,15 +21,19 @@ class IndianGoldMobileNotifier:
             "Intl_Gold": "GC=F"
         }
 
-    def fetch_market_signals() -> dict:
+    def fetch_market_signals(self) -> dict:
         """Fetches daily market movements for Indian Gold and USD/INR."""
         data = yf.download(tickers=list(self.tickers.values()), period="5d", interval="1d", progress=False)['Close']
         
-        latest_gold_etf = data[self.tickers["Gold_ETF_India"]].iloc[-1]
-        latest_usdinr = data[self.tickers["USD_INR"]].iloc[-1]
+        # Handle yfinance MultiIndex columns
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+            
+        latest_gold_etf = data[self.tickers["Gold_ETF_India"]].dropna().iloc[-1]
+        latest_usdinr = data[self.tickers["USD_INR"]].dropna().iloc[-1]
         
-        gold_ret = data[self.tickers["Gold_ETF_India"]].pct_change().iloc[-1] * 100
-        usdinr_ret = data[self.tickers["USD_INR"]].pct_change().iloc[-1] * 100
+        gold_ret = data[self.tickers["Gold_ETF_India"]].dropna().pct_change().iloc[-1] * 100
+        usdinr_ret = data[self.tickers["USD_INR"]].dropna().pct_change().iloc[-1] * 100
         
         # Rule-based Signal Matrix
         if gold_ret > 0 and usdinr_ret > 0:
@@ -73,7 +77,6 @@ class IndianGoldMobileNotifier:
             print(f"[Failed] HTTP {res.status_code}: {res.text}")
 
 if __name__ == "__main__":
-    # Fetch secrets passed from GitHub Actions
     BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
