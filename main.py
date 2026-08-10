@@ -698,25 +698,42 @@ class AdvancedMarketEngine:
 def load_ipo_watchlist() -> list:
     """
     Populate today's IPO watchlist here. This is intentionally manual /
-    config-driven rather than scraped (see module docstring). You can also
-    load this from a small JSON/CSV file, an internal sheet, or a data
-    vendor API you're licensed to use -- the IPOAnalyzer just needs an
-    IPOListingInput per issue.
+    config-driven rather than scraped (see module docstring for why: GMP
+    trackers generally restrict automated scraping in their terms, their
+    markup changes often, and -- as importantly -- different trackers
+    report meaningfully different GMP figures for the same IPO at the
+    same time, since it's an unregulated, dealer-quoted number rather
+    than an exchange-published price. Pick one source you trust and
+    update this daily, or wire in a data vendor you're licensed to use.
 
-    Example only -- replace with today's real, actively-listing IPO(s).
+    Below are the two IPOs actually open as of 10 Aug 2026, populated
+    from public tracker pages as a live example. GMP shown is a single
+    recent snapshot -- cross-checking two or three sources on the day
+    you actually use this is worth the extra minute given the spread
+    seen above.
     """
     return [
-        # IPOListingInput(
-        #     name="Example Ltd",
-        #     issue_price=100.0,
-        #     gmp=35.0,                     # Rs. per share, from your source
-        #     retail_subscription_x=62.0,
-        #     qib_subscription_x=8.5,
-        #     overall_subscription_x=40.0,
-        #     listing_date="2026-08-11",
-        #     market_trend="neutral",       # "bullish" / "neutral" / "bearish"
-        #     sector_hot=True,
-        # ),
+        IPOListingInput(
+            name="Molbio Diagnostics",
+            issue_price=807.0,             # upper price band
+            gmp=150.0,                     # snapshot; seen ranging ~120-180 across sources
+            retail_subscription_x=None,    # opened today -- not yet meaningful, update near close (Aug 12)
+            qib_subscription_x=None,
+            overall_subscription_x=None,
+            listing_date="2026-08-17",
+            market_trend="neutral",        # update based on your own Nifty read that day
+            sector_hot=True,               # diagnostics/healthcare has had firm demand recently
+        ),
+        IPOListingInput(
+            name="Optimystix Entertainment",
+            issue_price=175.0,             # upper price band, SME issue
+            gmp=5.0,
+            overall_subscription_x=0.6,    # as of a few days into the bidding window
+            listing_date="2026-08-14",
+            market_trend="neutral",
+            sector_hot=False,              # media/content production, not a currently "hot" flow sector
+        ),
+        # Add more IPOListingInput(...) entries here as new issues open.
     ]
 
 
