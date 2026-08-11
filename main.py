@@ -242,6 +242,15 @@ class IPOListingInput:
     listing_date: Optional[str] = None
     market_trend: str = "neutral"
     sector_hot: Optional[bool] = None
+    # Set this to False for an IPO you've heard is open but whose price
+    # band / dates you found conflicting across sources (this happens more
+    # than you'd expect -- aggregator sites scrape from each other and
+    # table-row misalignment silently mixes up figures between adjacent
+    # IPOs). Unverified entries are excluded from the scored GMP analysis
+    # but still surface in the alert as a "verify before applying" prompt,
+    # so you don't lose track of an IPO just because its public data was
+    # messy on the day you checked.
+    verified: bool = True
 
 
 def filter_actionable_ipos(ipos: list, as_of: Optional[date] = None) -> list:
@@ -823,6 +832,7 @@ class AdvancedMarketEngine:
         gold_info: dict,
         picks_df: pd.DataFrame,
         ipo_results: Optional[list] = None,
+        unverified_ipos: Optional[list] = None,
     ):
         cfg = self.cfg
         if not cfg.bot_token or not cfg.chat_id:
@@ -892,6 +902,17 @@ class AdvancedMarketEngine:
             lines.append("--- IPO OPEN / UPCOMING FOR SUBSCRIPTION ---")
             lines.append("No IPOs currently open or opening soon in the configured watchlist.")
 
+        if unverified_ipos:
+            lines.append("")
+            lines.append("--- IPO: OPEN BUT NEEDS MANUAL VERIFICATION ---")
+            lines.append(
+                "Source data conflicted for these -- confirm price band/dates on "
+                "NSE's IPO page or the RHP, then update the watchlist entry:"
+            )
+            for ipo in unverified_ipos:
+                close_note = f" | Closes: {ipo.subscription_close_date}" if ipo.subscription_close_date else ""
+                lines.append(f"  - {ipo.name}{close_note}")
+
         lines.append("")
         lines.append(
             "_Screen + GMP read only: no backtest, GMP is unofficial/unregulated. "
@@ -928,16 +949,25 @@ def load_ipo_watchlist() -> list:
     date, an entry is kept indefinitely by default (with a warning in
     the logs), which defeats the point of this filter.
 
-    Below are the two IPOs actually open as of 10 Aug 2026, populated
-    from public tracker pages as a live example. GMP shown is a single
-    recent snapshot -- cross-checking two or three sources on the day
-    you actually use this is worth the extra minute given the spread
-    seen above.
+    Below reflects the fuller set of IPOs actually open as of 11 Aug 2026,
+    cross-checked across multiple public tracker pages as a live example.
+    Two things worth calling out from that cross-check itself:
+      - GMP for the same IPO varied by ~Rs.30-60 across trackers at the
+        same point in time (unregulated, dealer-quoted number -- expected).
+      - More surprisingly, a couple of aggregators showed internally
+        inconsistent price bands / segments for the SAME IPO (e.g. one
+        listed an SME issue as "Mainboard" with a price band that matched
+        a different, unrelated IPO's fresh-issue amount) -- almost
+        certainly a scraping/table-row misalignment on their end, not a
+        real discrepancy. Rather than guess which number is right,
+        conflicting entries are marked verified=False below and are
+        excluded from the scored analysis, but still show up in the alert
+        as a "confirm before applying" prompt.
     """
     return [
         IPOListingInput(
             name="Molbio Diagnostics",
-            issue_price=807.0,             # upper price band
+            issue_price=807.0,             # upper price band -- consistent across 3+ sources
             gmp=150.0,                     # snapshot; seen ranging ~120-180 across sources
             retail_subscription_x=None,    # opened today -- not yet meaningful, update near close (Aug 12)
             qib_subscription_x=None,
@@ -949,8 +979,19 @@ def load_ipo_watchlist() -> list:
             sector_hot=True,               # diagnostics/healthcare has had firm demand recently
         ),
         IPOListingInput(
+            name="Dhoot Transmission",
+            issue_price=871.0,             # upper price band -- consistent across dedicated review sites
+            gmp=250.0,                     # snapshot; cross-check before relying on it
+            overall_subscription_x=None,   # update near close (Aug 12) -- auto components name, watch QIB closely
+            subscription_open_date="2026-08-10",
+            subscription_close_date="2026-08-12",
+            listing_date="2026-08-17",
+            market_trend="neutral",
+            sector_hot=True,               # auto-components / EV-adjacent supplier, sector has had steady flows
+        ),
+        IPOListingInput(
             name="Optimystix Entertainment",
-            issue_price=175.0,             # upper price band, SME issue
+            issue_price=175.0,             # upper price band, SME issue -- confirmed across 5 sources
             gmp=5.0,
             overall_subscription_x=0.6,    # as of a few days into the bidding window
             subscription_open_date="2026-08-07",
@@ -958,6 +999,39 @@ def load_ipo_watchlist() -> list:
             listing_date="2026-08-14",
             market_trend="neutral",
             sector_hot=False,              # media/content production, not a currently "hot" flow sector
+        ),
+        # --- Flagged: open this week, but source data conflicted enough
+        # that I'm not confident in the exact price band/segment. Verify
+        # directly on NSE's IPO page or the RHP, fill in the confirmed
+        # issue_price/gmp, and flip verified=True once you have.
+        IPOListingInput(
+            name="LEAP India",
+            issue_price=159.0,             # UNVERIFIED -- one source said 159, another said 871 (likely a
+                                            # scraping mixup with Dhoot Transmission's own price band)
+            gmp=0.0,
+            subscription_open_date="2026-08-07",
+            subscription_close_date="2026-08-11",
+            listing_date="2026-08-14",
+            verified=False,
+        ),
+        IPOListingInput(
+            name="Technocraft Ventures",
+            issue_price=159.0,             # UNVERIFIED -- conflicting price bands seen across sources
+            gmp=0.0,
+            subscription_open_date="2026-08-07",
+            subscription_close_date="2026-08-11",
+            listing_date="2026-08-14",
+            verified=False,
+        ),
+        IPOListingInput(
+            name="LAPL Automotive",
+            issue_price=175.0,             # UNVERIFIED -- price band matched Optimystix's exactly across one
+                                            # source, which is more likely a scraping artifact than coincidence
+            gmp=0.0,
+            subscription_open_date="2026-08-07",
+            subscription_close_date="2026-08-11",
+            listing_date="2026-08-13",
+            verified=False,
         ),
         # Add more IPOListingInput(...) entries here as new issues open.
         # Once today's date passes an entry's subscription_close_date,
@@ -999,8 +1073,19 @@ if __name__ == "__main__":
     # application decision, not to report on issues you can no longer apply to.
     full_watchlist = load_ipo_watchlist()
     actionable_watchlist = filter_actionable_ipos(full_watchlist)
-    ipo_results = [IPOAnalyzer(ipo).analyze() for ipo in actionable_watchlist]
+
+    verified_ipos = [ipo for ipo in actionable_watchlist if ipo.verified]
+    unverified_ipos = [ipo for ipo in actionable_watchlist if not ipo.verified]
+
+    ipo_results = [IPOAnalyzer(ipo).analyze() for ipo in verified_ipos]
     for r in ipo_results:
         log.info("IPO read for %s (%s): %s", r["IPO"], r["Subscription_Status"], r["Recommendation"])
+    for ipo in unverified_ipos:
+        log.warning(
+            "IPO '%s' is open but marked unverified -- source data conflicted; "
+            "surfacing as a manual-check prompt only.", ipo.name,
+        )
 
-    engine.send_telegram_alert(gold_data, stock_picks, ipo_results=ipo_results)
+    engine.send_telegram_alert(
+        gold_data, stock_picks, ipo_results=ipo_results, unverified_ipos=unverified_ipos,
+    )
