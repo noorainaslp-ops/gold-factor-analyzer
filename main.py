@@ -49,7 +49,8 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 import numpy as np
@@ -93,6 +94,10 @@ class EngineConfig:
 
     rsi_min: float = 40.0
     rsi_max: float = 75.0
+
+    # Intraday profit-booking heuristic thresholds (see get_intraday_recommendation).
+    intraday_overbought_rsi: float = 65.0     # RSI above this = elevated / pullback-prone zone
+    intraday_extended_pct: float = 6.0        # % above the fast EMA considered "stretched"
 
     top_n: int = 3
     download_retries: int = 3
@@ -204,7 +209,17 @@ class IPOListingInput:
     overall_subscription_x:  Overall subscription, in "times".
     kostak_rate:        Optional -- premium for selling the application
                          itself before allotment (Rs per lot), if you track it.
-    listing_date:        Optional display string.
+    subscription_open_date:  "YYYY-MM-DD" -- when bidding opens.
+    subscription_close_date: "YYYY-MM-DD" -- when bidding closes. Used to
+                         decide whether this IPO still belongs in the
+                         alert: once this date has passed, the issue is
+                         no longer subscribable and is dropped from the
+                         "open for subscription" watch (see
+                         filter_actionable_ipos below) -- the alert is
+                         meant to help with an application decision, not
+                         to keep reporting on issues you can no longer
+                         apply to.
+    listing_date:        Optional display string ("YYYY-MM-DD" recommended).
     market_trend:       One of "bullish", "neutral", "bearish" -- your read
                          (or Nifty's recent trend) on the broader market
                          mood around the listing date, since GMP-implied
@@ -222,9 +237,53 @@ class IPOListingInput:
     qib_subscription_x: Optional[float] = None
     overall_subscription_x: Optional[float] = None
     kostak_rate: Optional[float] = None
+    subscription_open_date: Optional[str] = None
+    subscription_close_date: Optional[str] = None
     listing_date: Optional[str] = None
     market_trend: str = "neutral"
     sector_hot: Optional[bool] = None
+
+
+def filter_actionable_ipos(ipos: list, as_of: Optional[date] = None) -> list:
+    """
+    Keeps only IPOs you can still actually act on: currently open for
+    subscription, or opening soon. Drops anything whose subscription
+    window has already closed, so the alert doesn't keep reporting on
+    issues you can no longer apply to (that's a "how did it do" question,
+    which this script isn't built to answer -- it's meant to inform a
+    still-pending application decision).
+
+    If subscription_close_date is missing on an entry, it's kept by
+    default (assumed still relevant) but logged, since we can't verify
+    its status without that date.
+    """
+    as_of = as_of or date.today()
+
+    kept = []
+    for ipo in ipos:
+        if not ipo.subscription_close_date:
+            log.warning(
+                "IPO '%s' has no subscription_close_date set -- keeping it "
+                "in the alert by default, but its status can't be verified.",
+                ipo.name,
+            )
+            kept.append(ipo)
+            continue
+        try:
+            close_dt = date.fromisoformat(ipo.subscription_close_date)
+        except ValueError:
+            log.warning("IPO '%s' has an unparseable close date; keeping it.", ipo.name)
+            kept.append(ipo)
+            continue
+
+        if close_dt >= as_of:
+            kept.append(ipo)
+        else:
+            log.info(
+                "Dropping '%s' from alert -- subscription closed %s (already past).",
+                ipo.name, ipo.subscription_close_date,
+            )
+    return kept
 
 
 class IPOAnalyzer:
@@ -275,6 +334,23 @@ class IPOAnalyzer:
             (ipo.gmp / ipo.issue_price) * 100 if ipo.issue_price else 0.0
         )
         est_listing_price = ipo.issue_price + ipo.gmp
+
+        # --- Subscription-window status (open / upcoming / unknown) ------
+        today = date.today()
+        status = "UNKNOWN"
+        try:
+            if ipo.subscription_open_date:
+                open_dt = date.fromisoformat(ipo.subscription_open_date)
+                if open_dt > today:
+                    status = "UPCOMING"
+            if ipo.subscription_close_date:
+                close_dt = date.fromisoformat(ipo.subscription_close_date)
+                if close_dt >= today and status != "UPCOMING":
+                    status = "OPEN"
+                elif close_dt < today:
+                    status = "CLOSED"
+        except ValueError:
+            status = "UNKNOWN"
 
         # --- Base lean purely from GMP magnitude -----------------------
         if gmp_pct >= self.GMP_STRONG_PCT:
@@ -395,6 +471,9 @@ class IPOAnalyzer:
 
         return {
             "IPO": ipo.name,
+            "Subscription_Status": status,
+            "Subscription_Open_Date": ipo.subscription_open_date,
+            "Subscription_Close_Date": ipo.subscription_close_date,
             "Issue_Price": ipo.issue_price,
             "GMP": ipo.gmp,
             "GMP_Pct": round(gmp_pct, 1),
@@ -546,6 +625,16 @@ class AdvancedMarketEngine:
             trend_aligned = latest_price > ema_fast > sma_slow
             above_fast_only = latest_price > ema_fast
 
+            # Rolling daily volatility (20d) as % -- gives intraday-guidance
+            # a sense of this stock's typical daily swing, so "extended 6%
+            # above the EMA" can be read in context (routine for a volatile
+            # small-cap, unusual for a low-beta large-cap).
+            daily_vol_pct = float(series.pct_change().rolling(20).std().iloc[-1] * 100)
+
+            # Distance from the fast EMA, used for the "stretched" flag in
+            # the intraday recommendation below.
+            extension_from_ema_pct = ((latest_price - ema_fast) / ema_fast) * 100 if ema_fast else 0.0
+
             rows.append({
                 "Ticker": ticker.replace(".NS", ""),
                 "Price": round(latest_price, 2),
@@ -555,6 +644,8 @@ class AdvancedMarketEngine:
                 "SMA_Slow": round(sma_slow, 2),
                 "Trend_Aligned": trend_aligned,
                 "Above_Fast_EMA": above_fast_only,
+                "Daily_Vol_Pct": round(daily_vol_pct, 2) if not np.isnan(daily_vol_pct) else None,
+                "Extension_From_EMA_Pct": round(extension_from_ema_pct, 1),
             })
 
         if not rows:
@@ -612,7 +703,6 @@ class AdvancedMarketEngine:
         if len(top) > 1:
             price_panel = data[[t + ".NS" for t in top["Ticker"]]].dropna()
             corr_matrix = price_panel.pct_change().dropna().corr()
-            # Average pairwise correlation excluding the diagonal.
             n_names = len(corr_matrix)
             off_diag_sum = corr_matrix.values.sum() - n_names
             avg_corr = off_diag_sum / (n_names * (n_names - 1))
@@ -622,7 +712,109 @@ class AdvancedMarketEngine:
             top.attrs["avg_pairwise_correlation"] = None
             top.attrs["high_concentration_warning"] = False
 
+        # --- Intraday profit-booking lean per pick, combining today's
+        # RSI level, statistical significance of the move, and how
+        # stretched price is from its own fast EMA.
+        top["Intraday_Tier"] = ""
+        top["Intraday_Action"] = ""
+        for idx, row in top.iterrows():
+            rec = self.get_intraday_recommendation(row)
+            top.at[idx, "Intraday_Tier"] = rec["Tier"]
+            top.at[idx, "Intraday_Action"] = rec["Action"]
+
         return top
+
+    def get_intraday_recommendation(self, row: pd.Series) -> dict:
+        """
+        Turns a stock's already-computed factors into an intraday
+        profit-booking lean, using the same "count the caution flags"
+        approach as the IPO analyzer, so the two sections of the alert
+        reason about risk consistently.
+
+        Caution flags, each contributing one point:
+          1. RSI >= intraday_overbought_rsi: elevated zone where
+             short-term pullbacks / consolidation are common.
+          2. Extension_From_EMA_Pct >= intraday_extended_pct: price has
+             run meaningfully ahead of its own recent average, which
+             historically raises mean-reversion risk (read relative to
+             the stock's own daily volatility, since "6% stretch" means
+             very different things for a low-vol large-cap vs. a
+             high-vol small-cap).
+          3. Momentum_Significant is False: today's move isn't
+             statistically distinguishable from that stock's own daily
+             noise, so there's no strong statistical basis to expect it
+             to persist through the session.
+
+        More flags -> stronger lean toward booking profit rather than
+        holding for further continuation. This is a heuristic reasoning
+        aid, not a signal with a demonstrated hit rate -- treat the tier
+        as a structured way to weigh the same factors you'd look at
+        anyway, not as a rule to follow mechanically.
+        """
+        cfg = self.cfg
+        rsi = row["RSI"]
+        significant = bool(row.get("Momentum_Significant", False))
+        extension_pct = row.get("Extension_From_EMA_Pct", 0.0) or 0.0
+        daily_vol_pct = row.get("Daily_Vol_Pct", None)
+        trend_aligned = bool(row.get("Trend_Aligned", False))
+
+        overbought = rsi >= cfg.intraday_overbought_rsi
+        extended = extension_pct >= cfg.intraday_extended_pct
+
+        reasons = []
+        if overbought:
+            reasons.append(
+                f"RSI at {rsi} is in an elevated zone (>= {cfg.intraday_overbought_rsi}) "
+                "where short-term pauses or pullbacks are common."
+            )
+        if extended:
+            vol_note = f" (vs. a typical daily move of ~{daily_vol_pct}% for this name)" if daily_vol_pct else ""
+            reasons.append(
+                f"Price is {extension_pct:.1f}% above its fast EMA{vol_note} -- "
+                "a stretch that historically raises mean-reversion risk."
+            )
+        if not significant:
+            reasons.append(
+                "The recent move isn't statistically distinguishable from this "
+                "stock's own daily noise, so there's limited statistical basis "
+                "to expect it to extend through the session."
+            )
+        if trend_aligned and significant and not overbought and not extended:
+            reasons.append(
+                "Trend alignment and statistically-supported momentum, with "
+                "price not yet stretched, together favor letting a trailing "
+                "stop manage the exit rather than booking outright."
+            )
+
+        caution_count = sum([overbought, extended, not significant])
+
+        if caution_count >= 2:
+            tier = "LEAN: BOOK MOST/ALL INTRADAY"
+            action = (
+                "Multiple caution signals are stacked together. A risk-aware "
+                "approach commonly used in this situation is booking most or "
+                "all of the position into intraday strength rather than "
+                "assuming the move continues into the next session."
+            )
+        elif caution_count == 1:
+            tier = "LEAN: PARTIAL BOOKING + TRAIL STOP"
+            action = (
+                "One caution flag is present. Booking part of the position "
+                "and trailing a stop (e.g. near the fast EMA) on the "
+                "remainder is a common middle path -- it locks in some gain "
+                "while leaving room if the move continues."
+            )
+        else:
+            tier = "LEAN: HOLD WITH TRAILING STOP"
+            action = (
+                "No major caution flags today -- RSI, statistical "
+                "significance, and trend all lean supportive. Holding with "
+                "a trailing stop (rather than a fixed target) is a common "
+                "way to stay with the position without giving back the "
+                "full gain if sentiment reverses."
+            )
+
+        return {"Tier": tier, "Action": action, "Reasons": reasons}
 
     # ---- Notification ----------------------------------------------------
 
@@ -636,7 +828,12 @@ class AdvancedMarketEngine:
         if not cfg.bot_token or not cfg.chat_id:
             raise ValueError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID.")
 
-        now_str = datetime.now().strftime("%d %b %Y, %H:%M")
+        # Explicit IST conversion -- GitHub Actions runners are UTC, so
+        # datetime.now() alone silently showed server (UTC) time before,
+        # which is why the earlier alert read "04:15" for what was meant
+        # to be an 11:00 AM IST send.
+        now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+        now_str = now_ist.strftime("%d %b %Y, %H:%M IST")
 
         sig_tag = "significant" if gold_info.get("Signal_Significant") else "not statistically significant"
         lines = [
@@ -660,6 +857,16 @@ class AdvancedMarketEngine:
                 f"{cfg.momentum_lookback_days}D mom: {row['Momentum_Pct']}% ({sig_note}) | "
                 f"RSI: {row['RSI']} | Score: {row['Composite_Score']}"
             )
+            ext = row.get("Extension_From_EMA_Pct")
+            vol = row.get("Daily_Vol_Pct")
+            if ext is not None:
+                vol_note = f" | typical daily move ~{vol}%" if vol else ""
+                lines.append(f"   Extension from EMA: {ext}%{vol_note}")
+            tier = row.get("Intraday_Tier")
+            action = row.get("Intraday_Action")
+            if tier:
+                lines.append(f"   INTRADAY: {tier}")
+                lines.append(f"   -> {action}")
         avg_corr = picks_df.attrs.get("avg_pairwise_correlation")
         if avg_corr is not None:
             warn = " (HIGH CONCENTRATION)" if picks_df.attrs.get("high_concentration_warning") else ""
@@ -667,14 +874,23 @@ class AdvancedMarketEngine:
 
         if ipo_results:
             lines.append("")
-            lines.append("--- IPO LISTING / GMP WATCH ---")
+            lines.append("--- IPO OPEN / UPCOMING FOR SUBSCRIPTION ---")
             for r in ipo_results:
+                status = r.get("Subscription_Status", "UNKNOWN")
+                close_note = f" | Closes: {r['Subscription_Close_Date']}" if r.get("Subscription_Close_Date") else ""
                 lines.append(
-                    f"{r['IPO']}: Issue Rs.{r['Issue_Price']} | GMP Rs.{r['GMP']} "
+                    f"{r['IPO']} [{status}]{close_note}"
+                )
+                lines.append(
+                    f"  Issue Rs.{r['Issue_Price']} | GMP Rs.{r['GMP']} "
                     f"({r['GMP_Pct']}%) | Est. listing Rs.{r['Estimated_Listing_Price']} "
                     f"| Tier: {r['GMP_Tier']}"
                 )
                 lines.append(f"  -> {r['Recommendation']}")
+        else:
+            lines.append("")
+            lines.append("--- IPO OPEN / UPCOMING FOR SUBSCRIPTION ---")
+            lines.append("No IPOs currently open or opening soon in the configured watchlist.")
 
         lines.append("")
         lines.append(
@@ -706,6 +922,12 @@ def load_ipo_watchlist() -> list:
     than an exchange-published price. Pick one source you trust and
     update this daily, or wire in a data vendor you're licensed to use.
 
+    ALWAYS set subscription_open_date / subscription_close_date -- these
+    are what filter_actionable_ipos() uses to automatically drop an IPO
+    from the alert once you can no longer apply to it. Without a close
+    date, an entry is kept indefinitely by default (with a warning in
+    the logs), which defeats the point of this filter.
+
     Below are the two IPOs actually open as of 10 Aug 2026, populated
     from public tracker pages as a live example. GMP shown is a single
     recent snapshot -- cross-checking two or three sources on the day
@@ -720,6 +942,8 @@ def load_ipo_watchlist() -> list:
             retail_subscription_x=None,    # opened today -- not yet meaningful, update near close (Aug 12)
             qib_subscription_x=None,
             overall_subscription_x=None,
+            subscription_open_date="2026-08-10",
+            subscription_close_date="2026-08-12",
             listing_date="2026-08-17",
             market_trend="neutral",        # update based on your own Nifty read that day
             sector_hot=True,               # diagnostics/healthcare has had firm demand recently
@@ -729,11 +953,17 @@ def load_ipo_watchlist() -> list:
             issue_price=175.0,             # upper price band, SME issue
             gmp=5.0,
             overall_subscription_x=0.6,    # as of a few days into the bidding window
+            subscription_open_date="2026-08-07",
+            subscription_close_date="2026-08-11",
             listing_date="2026-08-14",
             market_trend="neutral",
             sector_hot=False,              # media/content production, not a currently "hot" flow sector
         ),
         # Add more IPOListingInput(...) entries here as new issues open.
+        # Once today's date passes an entry's subscription_close_date,
+        # filter_actionable_ipos() drops it from the alert automatically --
+        # you can leave past entries in this list and they'll age out on
+        # their own rather than needing manual deletion.
     ]
 
 
@@ -759,11 +989,18 @@ if __name__ == "__main__":
             "RSI": 58.4, "EMA_Fast": 1301.00, "SMA_Slow": 1290.00,
             "Trend_Aligned": True, "Above_Fast_EMA": True, "Composite_Score": 0.0,
             "Momentum_P_Value": 1.0, "Momentum_Significant": False,
+            "Extension_From_EMA_Pct": 0.0, "Daily_Vol_Pct": None,
+            "Intraday_Tier": "LEAN: HOLD WITH TRAILING STOP", "Intraday_Action": "Fallback data.",
         }])
 
-    ipo_watchlist = load_ipo_watchlist()
-    ipo_results = [IPOAnalyzer(ipo).analyze() for ipo in ipo_watchlist]
+    # Only IPOs still open (or opening soon) for subscription reach the
+    # alert -- anything whose bidding window has already closed is dropped
+    # automatically, since the point is to inform a still-pending
+    # application decision, not to report on issues you can no longer apply to.
+    full_watchlist = load_ipo_watchlist()
+    actionable_watchlist = filter_actionable_ipos(full_watchlist)
+    ipo_results = [IPOAnalyzer(ipo).analyze() for ipo in actionable_watchlist]
     for r in ipo_results:
-        log.info("IPO read for %s: %s", r["IPO"], r["Recommendation"])
+        log.info("IPO read for %s (%s): %s", r["IPO"], r["Subscription_Status"], r["Recommendation"])
 
     engine.send_telegram_alert(gold_data, stock_picks, ipo_results=ipo_results)
