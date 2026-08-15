@@ -90,7 +90,21 @@ class EngineConfig:
     rsi_period: int = 14
     ema_fast: int = 20
     sma_slow: int = 50
-    momentum_lookback_days: int = 5
+
+    # v4 change: 5-day return is deliberately no longer the ranking
+    # momentum factor. Short lookbacks (1-2 weeks) fall inside the
+    # well-documented short-term REVERSAL window (Jegadeesh 1990) --
+    # using it to rank "which stock will keep going up" was fighting a
+    # known market effect, which is a plausible explanation for the
+    # AUROPHARMA/NAUKRI reversals seen in live alerts. Medium-term
+    # momentum (Jegadeesh & Titman 1993), typically 3-12 months with the
+    # most recent ~1 month skipped, has the actual academic support for
+    # continuation. short_momentum_lookback_days is kept only as a
+    # DISPLAY/CAUTION input (how extended is this move right now), not
+    # as a ranking factor.
+    short_momentum_lookback_days: int = 5
+    medium_momentum_lookback_days: int = 126   # ~6 trading months
+    medium_momentum_skip_days: int = 21        # skip most recent ~1 month
 
     rsi_min: float = 40.0
     rsi_max: float = 75.0
@@ -99,9 +113,21 @@ class EngineConfig:
     intraday_overbought_rsi: float = 65.0     # RSI above this = elevated / pullback-prone zone
     intraday_extended_pct: float = 6.0        # % above the fast EMA considered "stretched"
 
+    # Regime filter: momentum-style ranking tends to work in trending
+    # markets and fail in choppy/range-bound ones. Rather than blindly
+    # emitting top picks regardless of the broader market's own trend,
+    # check the index itself first.
+    regime_index_ticker: str = "^NSEI"   # Nifty 50 index
+    regime_sma_period: int = 50
+
     top_n: int = 3
     download_retries: int = 3
     retry_backoff_sec: float = 3.0
+
+    # Where the daily picks get appended so the system can audit its own
+    # track record over time instead of requiring manual reconstruction
+    # from old alert messages (as had to be done for the 9-14 Aug review).
+    alert_history_path: str = "alert_history.csv"
 
     # A reasonably complete, liquid Nifty-100-style universe.
     # Swap this out for a live constituent list (e.g. NSE index file /
@@ -156,12 +182,12 @@ def download_with_retries(tickers, period, interval, retries, backoff_sec):
     raise RuntimeError(f"All download attempts failed: {last_err}")
 
 
-def wilders_rsi(series: pd.Series, period: int = 14) -> float:
+def wilders_rsi_series(series: pd.Series, period: int = 14) -> pd.Series:
     """
-    Standard Wilder RSI using an exponential (alpha=1/period) smoothing of
-    gains/losses, rather than a plain rolling mean. This matches the RSI
-    values shown on most charting platforms (TradingView, brokers, etc.),
-    whereas a simple rolling-mean RSI drifts away from that over time.
+    Full-series Wilder RSI (exponential alpha=1/period smoothing of
+    gains/losses). Returns the RSI at every date, not just the latest --
+    needed for backtesting, where we must compute what the RSI *would
+    have been* on each historical day using only data up to that day.
     """
     delta = series.diff().dropna()
     gain = delta.clip(lower=0)
@@ -172,7 +198,12 @@ def wilders_rsi(series: pd.Series, period: int = 14) -> float:
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    valid = rsi.dropna()
+    return rsi
+
+
+def wilders_rsi(series: pd.Series, period: int = 14) -> float:
+    """Latest-value convenience wrapper around wilders_rsi_series."""
+    valid = wilders_rsi_series(series, period).dropna()
     return float(valid.iloc[-1]) if not valid.empty else 50.0
 
 
@@ -594,27 +625,142 @@ class AdvancedMarketEngine:
                 "RSI": 52.0, "Signal": "MODERATE / MIXED DRIVERS (fallback)",
             }
 
+    # ---- Market regime ----------------------------------------------------
+
+    def get_market_regime(self) -> dict:
+        """
+        Checks whether the broader market (Nifty 50) is itself trending,
+        since momentum-style stock ranking has historically worked better
+        in trending markets and worse in choppy/range-bound ones. This
+        doesn't veto the alert -- it's a caution flag attached to it, so
+        you can weight conviction (and position size) accordingly rather
+        than treating every day's top picks as equally reliable regardless
+        of what the index itself is doing.
+        """
+        cfg = self.cfg
+        try:
+            data = download_with_retries(
+                [cfg.regime_index_ticker], period="1y", interval="1d",
+                retries=cfg.download_retries, backoff_sec=cfg.retry_backoff_sec,
+            )
+            series = data[cfg.regime_index_ticker].dropna() if cfg.regime_index_ticker in data.columns else data.iloc[:, 0].dropna()
+            if len(series) < cfg.regime_sma_period + 5:
+                raise ValueError("Insufficient index history for regime check.")
+
+            latest = float(series.iloc[-1])
+            sma = float(series.rolling(cfg.regime_sma_period).mean().iloc[-1])
+            pct_vs_sma = ((latest - sma) / sma) * 100
+
+            # Simple trend slope: is the SMA itself rising or falling over
+            # the last ~10 sessions? Adds a bit more nuance than "above/
+            # below" alone -- a index just barely above a flattening SMA
+            # is a weaker trend than one clearly above a rising SMA.
+            sma_series = series.rolling(cfg.regime_sma_period).mean().dropna()
+            sma_slope_pct = float(((sma_series.iloc[-1] - sma_series.iloc[-11]) / sma_series.iloc[-11]) * 100) if len(sma_series) > 11 else 0.0
+
+            if latest > sma and sma_slope_pct > 0:
+                regime = "FAVORABLE"
+                note = "Nifty 50 is above its rising 50-day average -- historically a more supportive backdrop for momentum-style picks."
+            elif latest < sma and sma_slope_pct < 0:
+                regime = "UNFAVORABLE"
+                note = "Nifty 50 is below its falling 50-day average -- momentum strategies have historically underperformed in this regime. Consider reduced conviction/position size on today's picks."
+            else:
+                regime = "MIXED"
+                note = "Nifty 50's trend signals are mixed (e.g. above the average but the average itself isn't clearly rising, or vice versa) -- treat today's picks with moderate, not high, conviction."
+
+            return {
+                "Regime": regime,
+                "Index_Level": round(latest, 1),
+                "SMA_Level": round(sma, 1),
+                "Pct_Vs_SMA": round(pct_vs_sma, 2),
+                "SMA_Slope_Pct_10d": round(sma_slope_pct, 2),
+                "Note": note,
+            }
+        except Exception as e:  # noqa: BLE001
+            log.warning("Regime check failed: %s -- treating as UNKNOWN.", e)
+            return {
+                "Regime": "UNKNOWN", "Index_Level": None, "SMA_Level": None,
+                "Pct_Vs_SMA": None, "SMA_Slope_Pct_10d": None,
+                "Note": "Regime check failed to fetch index data -- treat picks with normal caution.",
+            }
+
+    # ---- Alert history logging --------------------------------------------
+
+    def log_alert_history(self, picks_df: pd.DataFrame, regime: dict):
+        """
+        Appends today's picks to a local CSV so the system's own track
+        record accumulates automatically -- this is what made the manual
+        9-14 Aug review possible in the first place, and it shouldn't
+        require reconstructing prices from old chat messages every time.
+
+        Note on persistence: GitHub Actions runners are ephemeral, so a
+        file written here disappears when the job ends UNLESS your
+        workflow commits it back to the repo (or writes it to external
+        storage -- a Google Sheet, a small database, S3, etc.). See the
+        commented git commit-back step in market_alert.yml for the
+        simplest option if you're running this via GitHub Actions.
+        """
+        cfg = self.cfg
+        today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+
+        rows = []
+        for _, row in picks_df.iterrows():
+            rows.append({
+                "date": today_str,
+                "ticker": row.get("Ticker"),
+                "price": row.get("Price"),
+                "medium_momentum_pct": row.get("Medium_Momentum_Pct"),
+                "short_momentum_pct": row.get("Short_Momentum_Pct"),
+                "rsi": row.get("RSI"),
+                "composite_score": row.get("Composite_Score"),
+                "intraday_tier": row.get("Intraday_Tier"),
+                "regime": regime.get("Regime"),
+            })
+        new_rows = pd.DataFrame(rows)
+
+        try:
+            if os.path.exists(cfg.alert_history_path):
+                existing = pd.read_csv(cfg.alert_history_path)
+                combined = pd.concat([existing, new_rows], ignore_index=True)
+            else:
+                combined = new_rows
+            combined.to_csv(cfg.alert_history_path, index=False)
+            log.info("Logged %d picks to %s", len(new_rows), cfg.alert_history_path)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not write alert history: %s", e)
+
     # ---- Stocks ----------------------------------------------------------
 
     def get_multi_factor_stock_picks(self) -> pd.DataFrame:
         """
         Screens the configured universe on trend alignment, RSI health,
-        and short-term momentum, then ranks survivors using cross-sectional
-        z-scores (relative to that day's surviving universe) instead of
-        fixed point caps. Returns the top N as a DataFrame.
+        and MEDIUM-TERM momentum (not short-term), then ranks survivors
+        using cross-sectional z-scores. Returns the top N as a DataFrame.
+
+        v4 change: the primary momentum factor is now a ~6-month return
+        with the most recent ~1 month skipped (medium_momentum_lookback_days
+        / medium_momentum_skip_days), rather than a 5-day return. Short
+        lookbacks fall inside the well-documented short-term reversal
+        window; using one to rank "which stock keeps going up" was
+        fighting a known market effect rather than exploiting one. The
+        5-day figure is still computed and shown (as Short_Momentum_Pct)
+        for context and for the intraday extension/caution flags, but it
+        no longer drives the ranking itself.
         """
         cfg = self.cfg
         data = download_with_retries(
-            cfg.stock_universe, period="6mo", interval="1d",
+            cfg.stock_universe, period="1y", interval="1d",
             retries=cfg.download_retries, backoff_sec=cfg.retry_backoff_sec,
         )
+
+        min_history = cfg.medium_momentum_lookback_days + cfg.medium_momentum_skip_days + 10
 
         rows = []
         for ticker in cfg.stock_universe:
             if ticker not in data.columns:
                 continue
             series = data[ticker].dropna()
-            if len(series) < cfg.sma_slow + 5:
+            if len(series) < max(cfg.sma_slow + 5, min_history):
                 continue
 
             latest_price = float(series.iloc[-1])
@@ -622,10 +768,18 @@ class AdvancedMarketEngine:
             sma_slow = float(series.rolling(window=cfg.sma_slow).mean().iloc[-1])
             rsi = wilders_rsi(series, cfg.rsi_period)
 
-            lb = cfg.momentum_lookback_days
-            if len(series) <= lb:
-                continue
-            momentum_pct = float(((latest_price - series.iloc[-lb - 1]) / series.iloc[-lb - 1]) * 100)
+            lb_short = cfg.short_momentum_lookback_days
+            short_momentum_pct = float(((latest_price - series.iloc[-lb_short - 1]) / series.iloc[-lb_short - 1]) * 100)
+
+            # Medium-term momentum: return from (lookback+skip) days ago to
+            # (skip) days ago -- i.e. the ~6-month formation period,
+            # excluding the most recent ~1 month where reversal effects
+            # dominate. This is the factor actually used for ranking.
+            skip = cfg.medium_momentum_skip_days
+            look = cfg.medium_momentum_lookback_days
+            price_formation_start = float(series.iloc[-(look + skip) - 1])
+            price_formation_end = float(series.iloc[-skip - 1])
+            medium_momentum_pct = float(((price_formation_end - price_formation_start) / price_formation_start) * 100)
 
             # Screen out overbought/oversold extremes before ranking.
             if rsi > cfg.rsi_max or rsi < cfg.rsi_min:
@@ -647,7 +801,8 @@ class AdvancedMarketEngine:
             rows.append({
                 "Ticker": ticker.replace(".NS", ""),
                 "Price": round(latest_price, 2),
-                "Momentum_Pct": momentum_pct,
+                "Short_Momentum_Pct": round(short_momentum_pct, 2),   # display/caution only
+                "Medium_Momentum_Pct": round(medium_momentum_pct, 2), # ranking factor
                 "RSI": rsi,
                 "EMA_Fast": round(ema_fast, 2),
                 "SMA_Slow": round(sma_slow, 2),
@@ -665,7 +820,7 @@ class AdvancedMarketEngine:
         # Cross-sectional z-scores computed *within today's surviving set*,
         # so the ranking adapts to current market dispersion instead of
         # relying on hand-picked constants.
-        df["z_momentum"] = zscore(df["Momentum_Pct"])
+        df["z_momentum"] = zscore(df["Medium_Momentum_Pct"])
         # RSI "quality" centered on 60 (healthy-but-not-overbought zone);
         # smaller |RSI-60| is better, so z-score the negative distance.
         df["z_rsi_quality"] = zscore(-(df["RSI"] - 60).abs())
@@ -680,21 +835,25 @@ class AdvancedMarketEngine:
         )
 
         df = df.sort_values("Composite_Score", ascending=False).reset_index(drop=True)
-        df["Momentum_Pct"] = df["Momentum_Pct"].round(2)
         df["RSI"] = df["RSI"].round(1)
         df["Composite_Score"] = df["Composite_Score"].round(3)
 
         top = df.head(cfg.top_n).copy()
 
         # --- Significance check: is this stock's momentum distinguishable
-        # from its own noise, or just "best of a noisy batch"? Rough
-        # one-sample t-test of daily returns over the lookback window
-        # against a null of zero mean.
+        # from its own noise, or just "best of a noisy batch"? One-sample
+        # t-test of daily returns over the formation window (medium-term
+        # momentum lookback) against a null of zero mean. Widened from the
+        # original 5-day window -- 5 daily observations is too few for a
+        # t-test to mean much; using the same ~6-month window the ranking
+        # itself is based on makes this check consistent with what's
+        # actually being ranked.
         sig_flags, p_values = [], []
         for ticker in top["Ticker"]:
             full_ticker = ticker + ".NS"
             series = data[full_ticker].dropna()
-            daily_rets = series.pct_change().dropna().iloc[-cfg.momentum_lookback_days:]
+            window = cfg.medium_momentum_lookback_days
+            daily_rets = series.pct_change().dropna().iloc[-window:]
             n = len(daily_rets)
             if n > 2 and daily_rets.std(ddof=1) > 0:
                 se = daily_rets.std(ddof=1) / np.sqrt(n)
@@ -833,6 +992,7 @@ class AdvancedMarketEngine:
         picks_df: pd.DataFrame,
         ipo_results: Optional[list] = None,
         unverified_ipos: Optional[list] = None,
+        regime: Optional[dict] = None,
     ):
         cfg = self.cfg
         if not cfg.bot_token or not cfg.chat_id:
@@ -850,6 +1010,11 @@ class AdvancedMarketEngine:
             "*MULTI-FACTOR MARKET ALERT*",
             f"_{now_str}_",
             "",
+        ]
+        if regime:
+            lines.append(f"MARKET REGIME: {regime['Regime']} -- {regime['Note']}")
+            lines.append("")
+        lines += [
             "--- GOLD STATISTICAL SIGNAL ---",
             f"GOLDBEES: Rs.{gold_info['Gold_Price']} ({gold_info['Gold_Change']}%)",
             f"USD/INR: Rs.{gold_info['USD_INR']}",
@@ -858,15 +1023,18 @@ class AdvancedMarketEngine:
             f"Ann. Volatility: {gold_info['Ann_Volatility_Pct']}%",
             f"Signal: {gold_info['Signal']}",
             "",
-            "--- TOP QUANT PICKS (cross-sectional z-score ranking) ---",
+            "--- TOP QUANT PICKS (~6mo momentum, skip 1mo -- see notes) ---",
         ]
         for i, row in picks_df.iterrows():
             sig_note = "sig." if row.get("Momentum_Significant") else "noise-level"
             lines.append(
                 f"{i + 1}. {row['Ticker']} | Rs.{row['Price']} | "
-                f"{cfg.momentum_lookback_days}D mom: {row['Momentum_Pct']}% ({sig_note}) | "
+                f"~6mo mom (skip 1mo): {row['Medium_Momentum_Pct']}% ({sig_note}) | "
                 f"RSI: {row['RSI']} | Score: {row['Composite_Score']}"
             )
+            short_mom = row.get("Short_Momentum_Pct")
+            if short_mom is not None:
+                lines.append(f"   {cfg.short_momentum_lookback_days}D move: {short_mom}% (context/caution only, not ranked on)")
             ext = row.get("Extension_From_EMA_Pct")
             vol = row.get("Daily_Vol_Pct")
             if ext is not None:
@@ -926,6 +1094,209 @@ class AdvancedMarketEngine:
         res = requests.post(url, json=payload, timeout=10)
         res.raise_for_status()
         log.info("Alert delivered to Telegram.")
+
+
+# ---------------------------------------------------------------------------
+# Backtesting -- walk-forward simulation of the exact scoring logic above
+# ---------------------------------------------------------------------------
+
+def backtest_stock_strategy(
+    cfg: EngineConfig,
+    period: str = "2y",
+    start_offset_days: int = 200,
+    forward_horizons: tuple = (1, 3, 5, 10),
+) -> tuple:
+    """
+    Replays get_multi_factor_stock_picks()'s exact logic (medium-term
+    momentum, RSI screen, trend alignment, z-score composite) on every
+    historical trading day in the backtest window, using ONLY data that
+    would have been available up to that day (no look-ahead), then
+    checks what actually happened over the following 1/3/5/10 trading
+    days. This is what turns "no backtest included" from a disclaimer
+    into an answerable question.
+
+    Returns (trades_df, summary_dict). trades_df has one row per
+    historical pick with its forward returns; summary_dict aggregates
+    hit rate and average return per horizon, plus a same-period Nifty 50
+    buy-and-hold comparison so you can see whether the strategy actually
+    added anything over just holding the index.
+
+    Honest limitations of this backtest (read before trusting the output):
+      - No transaction costs, slippage, brokerage, or STT are modeled --
+        real returns will be lower, especially for short holding periods.
+      - No position sizing / capital constraints -- assumes you could
+        take every signal at full size, which isn't realistic.
+      - Survivorship bias: cfg.stock_universe is today's list of liquid
+        names, not the actual historical Nifty-100 constituents on each
+        past date -- names that were removed from the index (due to
+        underperformance, among other reasons) aren't in the test.
+      - Single-market, single-universe test -- statistical significance
+        of the aggregate hit rate should be checked (e.g. is it
+        meaningfully different from 50% given the sample size?) rather
+        than eyeballed.
+    """
+    log.info("Downloading %s of history for %d tickers for backtest...", period, len(cfg.stock_universe))
+    data = download_with_retries(
+        cfg.stock_universe, period=period, interval="1d",
+        retries=cfg.download_retries, backoff_sec=cfg.retry_backoff_sec,
+    )
+
+    # Precompute full indicator series per ticker (vectorized), so the
+    # per-day loop below is just lookups, not recomputation.
+    indicators = {}
+    for ticker in cfg.stock_universe:
+        if ticker not in data.columns:
+            continue
+        s = data[ticker].dropna()
+        if len(s) < cfg.medium_momentum_lookback_days + cfg.medium_momentum_skip_days + start_offset_days:
+            continue
+        indicators[ticker] = {
+            "price": s,
+            "ema_fast": s.ewm(span=cfg.ema_fast, adjust=False).mean(),
+            "sma_slow": s.rolling(cfg.sma_slow).mean(),
+            "rsi": wilders_rsi_series(s, cfg.rsi_period),
+        }
+
+    if not indicators:
+        raise ValueError("Not enough historical data to backtest -- try a longer 'period'.")
+
+    # Common date index across all tickers with enough history.
+    all_dates = sorted(set().union(*[set(ind["price"].index) for ind in indicators.values()]))
+    test_dates = all_dates[start_offset_days:-max(forward_horizons)]
+    log.info("Backtesting over %d historical trading days...", len(test_dates))
+
+    trade_rows = []
+    for dt in test_dates:
+        day_rows = []
+        for ticker, ind in indicators.items():
+            price_series = ind["price"]
+            if dt not in price_series.index:
+                continue
+            idx = price_series.index.get_loc(dt)
+            if idx < cfg.medium_momentum_lookback_days + cfg.medium_momentum_skip_days:
+                continue
+
+            price = price_series.iloc[idx]
+            ema = ind["ema_fast"].iloc[idx]
+            sma = ind["sma_slow"].iloc[idx]
+            rsi = ind["rsi"].iloc[idx]
+            if pd.isna(ema) or pd.isna(sma) or pd.isna(rsi):
+                continue
+            if rsi > cfg.rsi_max or rsi < cfg.rsi_min:
+                continue
+
+            skip = cfg.medium_momentum_skip_days
+            look = cfg.medium_momentum_lookback_days
+            p_start = price_series.iloc[idx - look - skip]
+            p_end = price_series.iloc[idx - skip]
+            medium_mom = ((p_end - p_start) / p_start) * 100
+
+            trend_aligned = price > ema > sma
+
+            day_rows.append({
+                "Date": dt, "Ticker": ticker, "Idx": idx, "Price": price,
+                "RSI": rsi, "Medium_Momentum_Pct": medium_mom, "Trend_Aligned": trend_aligned,
+            })
+
+        if len(day_rows) < 3:
+            continue
+        day_df = pd.DataFrame(day_rows)
+        day_df["z_momentum"] = zscore(day_df["Medium_Momentum_Pct"])
+        day_df["z_rsi_quality"] = zscore(-(day_df["RSI"] - 60).abs())
+        day_df["z_trend"] = zscore(day_df["Trend_Aligned"].astype(float))
+        day_df["Composite_Score"] = 0.4 * day_df["z_momentum"] + 0.35 * day_df["z_rsi_quality"] + 0.25 * day_df["z_trend"]
+
+        top = day_df.sort_values("Composite_Score", ascending=False).head(cfg.top_n)
+
+        for _, row in top.iterrows():
+            price_series = indicators[row["Ticker"]]["price"]
+            idx = int(row["Idx"])
+            entry_price = row["Price"]
+            trade = {
+                "Date": dt, "Ticker": row["Ticker"], "Entry_Price": entry_price,
+                "RSI": round(row["RSI"], 1), "Medium_Momentum_Pct": round(row["Medium_Momentum_Pct"], 2),
+                "Composite_Score": round(row["Composite_Score"], 3),
+            }
+            for h in forward_horizons:
+                if idx + h < len(price_series):
+                    fwd_price = price_series.iloc[idx + h]
+                    trade[f"Fwd_{h}d_Pct"] = round(((fwd_price - entry_price) / entry_price) * 100, 2)
+                else:
+                    trade[f"Fwd_{h}d_Pct"] = np.nan
+            trade_rows.append(trade)
+
+    trades_df = pd.DataFrame(trade_rows)
+    if trades_df.empty:
+        raise ValueError("Backtest produced no trades -- check universe/date range.")
+
+    # --- Benchmark: Nifty 50 buy-and-hold over the same test window ---
+    try:
+        bench_data = download_with_retries(
+            [cfg.regime_index_ticker], period=period, interval="1d",
+            retries=cfg.download_retries, backoff_sec=cfg.retry_backoff_sec,
+        )
+        bench_series = bench_data[cfg.regime_index_ticker] if cfg.regime_index_ticker in bench_data.columns else bench_data.iloc[:, 0]
+        bench_series = bench_series.dropna()
+        bench_start = bench_series.loc[bench_series.index >= test_dates[0]].iloc[0]
+        bench_end = bench_series.iloc[-1]
+        bench_return_pct = round(((bench_end - bench_start) / bench_start) * 100, 2)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Benchmark fetch failed: %s", e)
+        bench_return_pct = None
+
+    summary = {"n_trades": len(trades_df), "nifty50_buyhold_pct_same_window": bench_return_pct}
+    for h in forward_horizons:
+        col = f"Fwd_{h}d_Pct"
+        valid = trades_df[col].dropna()
+        if len(valid) == 0:
+            continue
+        hit_rate = float((valid > 0).mean() * 100)
+        avg_return = float(valid.mean())
+        std_return = float(valid.std(ddof=1)) if len(valid) > 1 else 0.0
+        # One-sample t-test: is the average return significantly different
+        # from zero, given the sample size and observed dispersion?
+        if std_return > 0 and len(valid) > 1:
+            se = std_return / np.sqrt(len(valid))
+            t_stat = avg_return / se
+            p_val = float(2 * (1 - t_dist.cdf(abs(t_stat), df=len(valid) - 1)))
+        else:
+            p_val = 1.0
+        summary[f"{h}d_hit_rate_pct"] = round(hit_rate, 1)
+        summary[f"{h}d_avg_return_pct"] = round(avg_return, 2)
+        summary[f"{h}d_return_p_value"] = round(p_val, 3)
+        summary[f"{h}d_n"] = len(valid)
+
+    return trades_df, summary
+
+
+def print_backtest_report(trades_df: pd.DataFrame, summary: dict):
+    print("\n" + "=" * 70)
+    print("BACKTEST REPORT -- walk-forward simulation, no look-ahead")
+    print("=" * 70)
+    print(f"Total historical picks tested: {summary['n_trades']}")
+    if summary.get("nifty50_buyhold_pct_same_window") is not None:
+        print(f"Nifty 50 buy-and-hold return over same window: {summary['nifty50_buyhold_pct_same_window']}%")
+    print("-" * 70)
+    print(f"{'Horizon':<10}{'Hit Rate':<12}{'Avg Return':<14}{'p-value':<10}{'N':<6}")
+    for h in (1, 3, 5, 10):
+        if f"{h}d_hit_rate_pct" not in summary:
+            continue
+        sig = "*" if summary[f"{h}d_return_p_value"] < 0.05 else " "
+        print(
+            f"{h}d{sig:<8}"
+            f"{summary[f'{h}d_hit_rate_pct']}%{'':<6}"
+            f"{summary[f'{h}d_avg_return_pct']}%{'':<8}"
+            f"{summary[f'{h}d_return_p_value']:<10}"
+            f"{summary[f'{h}d_n']}"
+        )
+    print("-" * 70)
+    print("* = average return statistically distinguishable from zero at p<0.05")
+    print(
+        "\nReminder: no transaction costs/slippage modeled, and cfg.stock_universe\n"
+        "is today's liquid-names list applied retroactively (survivorship bias),\n"
+        "not the actual historical index constituents on each test date."
+    )
+    print("=" * 70 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -1042,13 +1413,38 @@ def load_ipo_watchlist() -> list:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Multi-factor market engine")
+    parser.add_argument(
+        "--backtest", action="store_true",
+        help="Run a walk-forward historical backtest instead of sending a live alert.",
+    )
+    parser.add_argument(
+        "--backtest-period", default="2y",
+        help="How much history to backtest over (yfinance period string, e.g. '1y', '2y'). Default: 2y.",
+    )
+    args = parser.parse_args()
+
     config = EngineConfig(
         bot_token=os.getenv("TELEGRAM_BOT_TOKEN"),
         chat_id=os.getenv("TELEGRAM_CHAT_ID"),
         top_n=int(os.getenv("TOP_N", "3")),
     )
 
+    if args.backtest:
+        # Validate the strategy against history BEFORE trusting it live.
+        # No Telegram alert is sent in this mode.
+        trades_df, summary = backtest_stock_strategy(config, period=args.backtest_period)
+        print_backtest_report(trades_df, summary)
+        trades_df.to_csv("backtest_trades.csv", index=False)
+        log.info("Full trade-level backtest detail written to backtest_trades.csv")
+        raise SystemExit(0)
+
     engine = AdvancedMarketEngine(config)
+
+    regime = engine.get_market_regime()
+    log.info("Market regime: %s", regime)
 
     gold_data = engine.get_probabilistic_gold_signal()
     log.info("Gold signal: %s", gold_data)
@@ -1059,13 +1455,16 @@ if __name__ == "__main__":
     except Exception as e:  # noqa: BLE001
         log.warning("Stock screen failed (%s); using single fallback pick.", e)
         stock_picks = pd.DataFrame([{
-            "Ticker": "RELIANCE", "Price": 1334.80, "Momentum_Pct": 2.06,
+            "Ticker": "RELIANCE", "Price": 1334.80, "Short_Momentum_Pct": 2.06,
+            "Medium_Momentum_Pct": 4.5,
             "RSI": 58.4, "EMA_Fast": 1301.00, "SMA_Slow": 1290.00,
             "Trend_Aligned": True, "Above_Fast_EMA": True, "Composite_Score": 0.0,
             "Momentum_P_Value": 1.0, "Momentum_Significant": False,
             "Extension_From_EMA_Pct": 0.0, "Daily_Vol_Pct": None,
             "Intraday_Tier": "LEAN: HOLD WITH TRAILING STOP", "Intraday_Action": "Fallback data.",
         }])
+
+    engine.log_alert_history(stock_picks, regime)
 
     # Only IPOs still open (or opening soon) for subscription reach the
     # alert -- anything whose bidding window has already closed is dropped
@@ -1088,4 +1487,5 @@ if __name__ == "__main__":
 
     engine.send_telegram_alert(
         gold_data, stock_picks, ipo_results=ipo_results, unverified_ipos=unverified_ipos,
+        regime=regime,
     )
