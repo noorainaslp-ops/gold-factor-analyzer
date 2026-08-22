@@ -3,3 +3,4 @@ numpy>=1.24.0
 yfinance>=0.2.20
 requests>=2.31.0
 scipy>=1.10.0
+scikit-learn
