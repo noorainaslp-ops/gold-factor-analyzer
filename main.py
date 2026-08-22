@@ -1,5 +1,5 @@
 """
-Multi-Factor Indian Market Engine v3
+Multi-Factor Indian Market Engine v5 — Short-Term Predictive Model
 (Nifty 100 statistical screen + Gold signal + IPO/GMP listing-day analysis)
 ---------------------------------------------------------------------------
 v3 adds, on top of v2:
@@ -58,6 +58,9 @@ import pandas as pd
 import requests
 import yfinance as yf
 from scipy.stats import norm, t as t_dist
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge, LogisticRegression
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -91,27 +94,34 @@ class EngineConfig:
     ema_fast: int = 20
     sma_slow: int = 50
 
-    # v4 change: 5-day return is deliberately no longer the ranking
-    # momentum factor. Short lookbacks (1-2 weeks) fall inside the
-    # well-documented short-term REVERSAL window (Jegadeesh 1990) --
-    # using it to rank "which stock will keep going up" was fighting a
-    # known market effect, which is a plausible explanation for the
-    # AUROPHARMA/NAUKRI reversals seen in live alerts. Medium-term
-    # momentum (Jegadeesh & Titman 1993), typically 3-12 months with the
-    # most recent ~1 month skipped, has the actual academic support for
-    # continuation. short_momentum_lookback_days is kept only as a
-    # DISPLAY/CAUTION input (how extended is this move right now), not
-    # as a ranking factor.
-    short_momentum_lookback_days: int = 5
-    medium_momentum_lookback_days: int = 126   # ~6 trading months
-    medium_momentum_skip_days: int = 21        # skip most recent ~1 month
+    # v5 is explicitly SHORT-TERM.  The old engine ranked stocks mainly on
+    # a ~6-month return and then used that ranking as if it predicted the
+    # next few sessions.  That is a mismatch between the feature and the
+    # trading horizon.  v5 instead learns directly from forward 3-session
+    # returns using only information available before each prediction date.
+    short_horizon_days: int = 3
+    model_lookback_days: int = 504       # ~2 years of trading sessions
+    model_min_samples: int = 2500
+    model_retrain_every_days: int = 5
+    ridge_alpha: float = 8.0
+    logistic_c: float = 0.35
 
-    rsi_min: float = 40.0
-    rsi_max: float = 75.0
+    rsi_min: float = 45.0
+    rsi_max: float = 68.0
+    min_pred_return_pct: float = 0.35
+    min_prob_up: float = 0.56
+    max_extension_vol_multiple: float = 1.25
+    min_relative_strength_5d_pct: float = -0.25
 
-    # Intraday profit-booking heuristic thresholds (see get_intraday_recommendation).
-    intraday_overbought_rsi: float = 65.0     # RSI above this = elevated / pullback-prone zone
-    intraday_extended_pct: float = 6.0        # % above the fast EMA considered "stretched"
+    # A false-positive filter is more valuable than forcing a trade every day.
+    # If no stock clears these thresholds, the alert should explicitly say
+    # NO TRADE instead of manufacturing three picks.
+    allow_no_trade: bool = True
+
+    # Profit-taking / risk controls for the short-term alert.
+    intraday_overbought_rsi: float = 68.0
+    intraday_extended_pct: float = 2.5
+    trailing_stop_atr_multiple: float = 1.2
 
     # Regime filter: momentum-style ranking tends to work in trending
     # markets and fail in choppy/range-bound ones. Rather than blindly
@@ -213,6 +223,95 @@ def zscore(values: pd.Series) -> pd.Series:
     if std == 0 or np.isnan(std):
         return pd.Series(0.0, index=values.index)
     return (values - values.mean()) / std
+
+
+# ---------------------------------------------------------------------------
+# Short-term supervised-model features
+# ---------------------------------------------------------------------------
+
+MODEL_FEATURES = [
+    "ret_1", "ret_2", "ret_3", "ret_5", "ret_10", "ret_20",
+    "rsi14", "dist_ema5", "dist_ema20", "dist_sma50",
+    "ema5_slope5", "ema20_slope10", "vol5", "vol20", "vol_ratio",
+    "nifty_ret_3", "nifty_ret_10", "relative_3", "relative_5", "relative_10",
+    "market_above_sma50", "market_sma50_slope10",
+]
+
+
+def build_short_term_features(stock_series: pd.Series, market_series: pd.Series, cfg: EngineConfig) -> pd.DataFrame:
+    """Build features whose values at date t use data available by t only."""
+    s = stock_series.astype(float)
+    m = market_series.reindex(s.index).ffill().astype(float)
+    r = s.pct_change()
+    mr = m.pct_change()
+
+    ema5 = s.ewm(span=5, adjust=False).mean()
+    ema20 = s.ewm(span=cfg.ema_fast, adjust=False).mean()
+    sma50 = s.rolling(cfg.sma_slow).mean()
+    m_sma50 = m.rolling(cfg.regime_sma_period).mean()
+
+    f = pd.DataFrame(index=s.index)
+    for n in [1, 2, 3, 5, 10, 20]:
+        f[f"ret_{n}"] = s.pct_change(n)
+    f["rsi14"] = wilders_rsi_series(s, cfg.rsi_period)
+    f["dist_ema5"] = s / ema5 - 1.0
+    f["dist_ema20"] = s / ema20 - 1.0
+    f["dist_sma50"] = s / sma50 - 1.0
+    f["ema5_slope5"] = ema5.pct_change(5)
+    f["ema20_slope10"] = ema20.pct_change(10)
+    f["vol5"] = r.rolling(5).std()
+    f["vol20"] = r.rolling(20).std()
+    f["vol_ratio"] = f["vol5"] / f["vol20"].replace(0, np.nan)
+    f["nifty_ret_3"] = mr.reindex(f.index)
+    f["nifty_ret_3"] = m.pct_change(3)
+    f["nifty_ret_10"] = m.pct_change(10)
+    f["relative_3"] = f["ret_3"] - f["nifty_ret_3"]
+    f["relative_5"] = f["ret_5"] - m.pct_change(5)
+    f["relative_10"] = f["ret_10"] - f["nifty_ret_10"]
+    f["market_above_sma50"] = (m > m_sma50).astype(float)
+    f["market_sma50_slope10"] = m_sma50.pct_change(10)
+
+    # Target is deliberately kept separate.  It is never used as a feature.
+    f[f"target_{cfg.short_horizon_days}d"] = s.shift(-cfg.short_horizon_days) / s - 1.0
+    f["target_date"] = pd.Series(s.index, index=s.index).shift(-cfg.short_horizon_days)
+    f["price"] = s
+    return f
+
+
+def fit_short_term_models(training: pd.DataFrame, cfg: EngineConfig):
+    """Fit a regularized return model and a direction model on past data only."""
+    training = training.dropna(subset=MODEL_FEATURES + [f"target_{cfg.short_horizon_days}d"])
+    if len(training) < cfg.model_min_samples:
+        return None, None, None
+
+    X = training[MODEL_FEATURES].replace([np.inf, -np.inf], np.nan).dropna()
+    y = training.loc[X.index, f"target_{cfg.short_horizon_days}d"]
+    if len(X) < cfg.model_min_samples:
+        return None, None, None
+
+    # Limit the influence of rare extreme winners/losers: the model should
+    # learn the typical short-term edge, not chase a handful of outliers.
+    y_clip = y.clip(y.quantile(0.01), y.quantile(0.99))
+    direction = (y > 0).astype(int)
+    if direction.nunique() < 2:
+        return None, None, None
+
+    return_model = Pipeline([
+        ("scale", StandardScaler()),
+        ("ridge", Ridge(alpha=cfg.ridge_alpha)),
+    ])
+    direction_model = Pipeline([
+        ("scale", StandardScaler()),
+        ("logit", LogisticRegression(C=cfg.logistic_c, max_iter=500, class_weight="balanced")),
+    ])
+    return_model.fit(X, y_clip)
+    direction_model.fit(X, direction.loc[X.index])
+
+    # Recent in-sample residual scale is used only to avoid presenting tiny
+    # model predictions as high-conviction signals.
+    pred = return_model.predict(X)
+    rmse = float(np.sqrt(np.mean((pred - y) ** 2)))
+    return return_model, direction_model, rmse
 
 
 # ---------------------------------------------------------------------------
@@ -709,10 +808,13 @@ class AdvancedMarketEngine:
                 "date": today_str,
                 "ticker": row.get("Ticker"),
                 "price": row.get("Price"),
-                "medium_momentum_pct": row.get("Medium_Momentum_Pct"),
-                "short_momentum_pct": row.get("Short_Momentum_Pct"),
+                "predicted_3d_return_pct": row.get("Predicted_3D_Return_Pct"),
+                "probability_up_3d_pct": row.get("Probability_Up_3D_Pct"),
+                "expected_edge_pct": row.get("Expected_Edge_Pct"),
                 "rsi": row.get("RSI"),
-                "composite_score": row.get("Composite_Score"),
+                "relative_5d_pct": row.get("Relative_5D_Pct"),
+                "extension_vs_vol": row.get("Extension_vs_Vol"),
+                "no_trade": row.get("No_Trade", False),
                 "intraday_tier": row.get("Intraday_Tier"),
                 "regime": regime.get("Regime"),
             })
@@ -733,256 +835,162 @@ class AdvancedMarketEngine:
 
     def get_multi_factor_stock_picks(self) -> pd.DataFrame:
         """
-        Screens the configured universe on trend alignment, RSI health,
-        and MEDIUM-TERM momentum (not short-term), then ranks survivors
-        using cross-sectional z-scores. Returns the top N as a DataFrame.
+        v5 short-term selector.
 
-        v4 change: the primary momentum factor is now a ~6-month return
-        with the most recent ~1 month skipped (medium_momentum_lookback_days
-        / medium_momentum_skip_days), rather than a 5-day return. Short
-        lookbacks fall inside the well-documented short-term reversal
-        window; using one to rank "which stock keeps going up" was
-        fighting a known market effect rather than exploiting one. The
-        5-day figure is still computed and shown (as Short_Momentum_Pct)
-        for context and for the intraday extension/caution flags, but it
-        no longer drives the ranking itself.
+        The old selector answered: "which stocks have strong medium-term
+        momentum?"  This selector answers the materially different question:
+        "given today's setup, which liquid names have the highest estimated
+        3-session return and probability of a positive 3-session return?"
+
+        The model is fitted only on historical observations whose 3-session
+        outcome was already known.  It also has a NO-TRADE state: forcing
+        three names every day was one of the biggest weaknesses of the old
+        alert design.
         """
         cfg = self.cfg
         data = download_with_retries(
-            cfg.stock_universe, period="1y", interval="1d",
+            cfg.stock_universe, period="3y", interval="1d",
             retries=cfg.download_retries, backoff_sec=cfg.retry_backoff_sec,
         )
+        market = download_with_retries(
+            [cfg.regime_index_ticker], period="3y", interval="1d",
+            retries=cfg.download_retries, backoff_sec=cfg.retry_backoff_sec,
+        )
+        market = market[cfg.regime_index_ticker] if cfg.regime_index_ticker in market.columns else market.iloc[:, 0]
+        market = market.dropna()
 
-        min_history = cfg.medium_momentum_lookback_days + cfg.medium_momentum_skip_days + 10
-
-        rows = []
+        feature_frames = {}
+        training_parts = []
         for ticker in cfg.stock_universe:
             if ticker not in data.columns:
                 continue
-            series = data[ticker].dropna()
-            if len(series) < max(cfg.sma_slow + 5, min_history):
+            s = data[ticker].dropna()
+            if len(s) < 650:
                 continue
+            f = build_short_term_features(s, market, cfg)
+            f["Ticker"] = ticker
+            feature_frames[ticker] = f
+            hist = f.copy()
+            hist = hist[hist["target_date"] < hist.index[-1]]
+            training_parts.append(hist.tail(cfg.model_lookback_days))
 
-            latest_price = float(series.iloc[-1])
-            ema_fast = float(series.ewm(span=cfg.ema_fast, adjust=False).mean().iloc[-1])
-            sma_slow = float(series.rolling(window=cfg.sma_slow).mean().iloc[-1])
-            rsi = wilders_rsi(series, cfg.rsi_period)
+        if not feature_frames:
+            raise ValueError("No stocks have enough history for the short-term model.")
 
-            lb_short = cfg.short_momentum_lookback_days
-            short_momentum_pct = float(((latest_price - series.iloc[-lb_short - 1]) / series.iloc[-lb_short - 1]) * 100)
+        training = pd.concat(training_parts, axis=0, ignore_index=True)
+        # The latest date's target is not known yet, so it can never enter the model.
+        current_date = max(f.index[-1] for f in feature_frames.values())
+        training = training[training["target_date"] < current_date]
+        return_model, direction_model, rmse = fit_short_term_models(training, cfg)
 
-            # Medium-term momentum: return from (lookback+skip) days ago to
-            # (skip) days ago -- i.e. the ~6-month formation period,
-            # excluding the most recent ~1 month where reversal effects
-            # dominate. This is the factor actually used for ranking.
-            skip = cfg.medium_momentum_skip_days
-            look = cfg.medium_momentum_lookback_days
-            price_formation_start = float(series.iloc[-(look + skip) - 1])
-            price_formation_end = float(series.iloc[-skip - 1])
-            medium_momentum_pct = float(((price_formation_end - price_formation_start) / price_formation_start) * 100)
+        if return_model is None or direction_model is None:
+            raise ValueError("Not enough clean historical observations to fit the short-term model.")
 
-            # Screen out overbought/oversold extremes before ranking.
-            if rsi > cfg.rsi_max or rsi < cfg.rsi_min:
+        rows = []
+        for ticker, f in feature_frames.items():
+            if current_date not in f.index:
                 continue
+            row = f.loc[[current_date]].copy()
+            x = row[MODEL_FEATURES].replace([np.inf, -np.inf], np.nan)
+            if x.isna().any(axis=1).iloc[0]:
+                continue
+            pred = float(return_model.predict(x)[0])
+            prob = float(direction_model.predict_proba(x)[0, 1])
+            price = float(row["price"].iloc[0])
+            rsi = float(row["rsi14"].iloc[0])
+            daily_vol = float(row["vol20"].iloc[0])
+            extension = float(row["dist_ema20"].iloc[0])
+            relative5 = float(row["relative_5"].iloc[0])
+            trend = bool((row["dist_ema20"].iloc[0] > 0) and (row["dist_sma50"].iloc[0] > 0) and (row["ema20_slope10"].iloc[0] > 0))
+            market_ok = bool(row["market_above_sma50"].iloc[0] > 0 and row["market_sma50_slope10"].iloc[0] > 0)
 
-            trend_aligned = latest_price > ema_fast > sma_slow
-            above_fast_only = latest_price > ema_fast
+            # Expected-return score penalizes low directional confidence and
+            # large model uncertainty.  It is NOT a guarantee of profit.
+            uncertainty_penalty = max(0.0, rmse * 0.35)
+            expected_edge = pred * (2.0 * prob - 1.0) - uncertainty_penalty
+            extension_multiple = extension / daily_vol if daily_vol > 0 else 99.0
 
-            # Rolling daily volatility (20d) as % -- gives intraday-guidance
-            # a sense of this stock's typical daily swing, so "extended 6%
-            # above the EMA" can be read in context (routine for a volatile
-            # small-cap, unusual for a low-beta large-cap).
-            daily_vol_pct = float(series.pct_change().rolling(20).std().iloc[-1] * 100)
-
-            # Distance from the fast EMA, used for the "stretched" flag in
-            # the intraday recommendation below.
-            extension_from_ema_pct = ((latest_price - ema_fast) / ema_fast) * 100 if ema_fast else 0.0
-
+            eligible = (
+                pred * 100 >= cfg.min_pred_return_pct and
+                prob >= cfg.min_prob_up and
+                cfg.rsi_min <= rsi <= cfg.rsi_max and
+                extension_multiple <= cfg.max_extension_vol_multiple and
+                relative5 * 100 >= cfg.min_relative_strength_5d_pct and
+                trend and
+                market_ok
+            )
             rows.append({
                 "Ticker": ticker.replace(".NS", ""),
-                "Price": round(latest_price, 2),
-                "Short_Momentum_Pct": round(short_momentum_pct, 2),   # display/caution only
-                "Medium_Momentum_Pct": round(medium_momentum_pct, 2), # ranking factor
-                "RSI": rsi,
-                "EMA_Fast": round(ema_fast, 2),
-                "SMA_Slow": round(sma_slow, 2),
-                "Trend_Aligned": trend_aligned,
-                "Above_Fast_EMA": above_fast_only,
-                "Daily_Vol_Pct": round(daily_vol_pct, 2) if not np.isnan(daily_vol_pct) else None,
-                "Extension_From_EMA_Pct": round(extension_from_ema_pct, 1),
+                "Price": round(price, 2),
+                "Predicted_3D_Return_Pct": round(pred * 100, 2),
+                "Probability_Up_3D_Pct": round(prob * 100, 1),
+                "Expected_Edge_Pct": round(expected_edge * 100, 2),
+                "Model_RMSE_Pct": round(rmse * 100, 2),
+                "RSI": round(rsi, 1),
+                "Relative_5D_Pct": round(relative5 * 100, 2),
+                "Extension_From_EMA_Pct": round(extension * 100, 2),
+                "Extension_vs_Vol": round(extension_multiple, 2),
+                "Daily_Vol_Pct": round(daily_vol * 100, 2),
+                "Trend_Aligned": trend,
+                "Market_OK": market_ok,
+                "Eligible": eligible,
             })
 
-        if not rows:
-            raise ValueError("No stocks survived the RSI/trend screen today.")
-
         df = pd.DataFrame(rows)
+        if df.empty:
+            raise ValueError("No valid short-term predictions were produced.")
 
-        # Cross-sectional z-scores computed *within today's surviving set*,
-        # so the ranking adapts to current market dispersion instead of
-        # relying on hand-picked constants.
-        df["z_momentum"] = zscore(df["Medium_Momentum_Pct"])
-        # RSI "quality" centered on 60 (healthy-but-not-overbought zone);
-        # smaller |RSI-60| is better, so z-score the negative distance.
-        df["z_rsi_quality"] = zscore(-(df["RSI"] - 60).abs())
-        df["trend_bonus"] = df["Trend_Aligned"].map({True: 1.0, False: 0.0}) + \
-                             df["Above_Fast_EMA"].map({True: 0.3, False: 0.0})
-        df["trend_bonus"] = zscore(df["trend_bonus"])
+        eligible_df = df[df["Eligible"]].copy()
+        if eligible_df.empty and cfg.allow_no_trade:
+            no_trade = df.sort_values(["Expected_Edge_Pct", "Probability_Up_3D_Pct"], ascending=False).head(1).copy()
+            no_trade["No_Trade"] = True
+            no_trade["Intraday_Tier"] = "NO TRADE"
+            no_trade["Intraday_Action"] = "No candidate cleared the short-term confidence/extension/trend filters. Preserve capital rather than forcing a position."
+            no_trade.attrs["avg_pairwise_correlation"] = None
+            no_trade.attrs["high_concentration_warning"] = False
+            return no_trade
 
-        df["Composite_Score"] = (
-            0.4 * df["z_momentum"] +
-            0.35 * df["z_rsi_quality"] +
-            0.25 * df["trend_bonus"]
-        )
+        eligible_df = eligible_df.sort_values(["Expected_Edge_Pct", "Probability_Up_3D_Pct"], ascending=False).head(cfg.top_n).reset_index(drop=True)
+        eligible_df["No_Trade"] = False
 
-        df = df.sort_values("Composite_Score", ascending=False).reset_index(drop=True)
-        df["RSI"] = df["RSI"].round(1)
-        df["Composite_Score"] = df["Composite_Score"].round(3)
-
-        top = df.head(cfg.top_n).copy()
-
-        # --- Significance check: is this stock's momentum distinguishable
-        # from its own noise, or just "best of a noisy batch"? One-sample
-        # t-test of daily returns over the formation window (medium-term
-        # momentum lookback) against a null of zero mean. Widened from the
-        # original 5-day window -- 5 daily observations is too few for a
-        # t-test to mean much; using the same ~6-month window the ranking
-        # itself is based on makes this check consistent with what's
-        # actually being ranked.
-        sig_flags, p_values = [], []
-        for ticker in top["Ticker"]:
-            full_ticker = ticker + ".NS"
-            series = data[full_ticker].dropna()
-            window = cfg.medium_momentum_lookback_days
-            daily_rets = series.pct_change().dropna().iloc[-window:]
-            n = len(daily_rets)
-            if n > 2 and daily_rets.std(ddof=1) > 0:
-                se = daily_rets.std(ddof=1) / np.sqrt(n)
-                t_stat = daily_rets.mean() / se
-                p_val = float(2 * (1 - t_dist.cdf(abs(t_stat), df=n - 1)))
-            else:
-                p_val = 1.0
-            p_values.append(round(p_val, 3))
-            sig_flags.append(p_val < 0.10)  # lenient threshold given tiny n
-        top["Momentum_P_Value"] = p_values
-        top["Momentum_Significant"] = sig_flags
-
-        # --- Concentration / correlation flag across the finalists, so
-        # "3 diversified picks" doesn't quietly mean "3 correlated bets."
-        if len(top) > 1:
-            price_panel = data[[t + ".NS" for t in top["Ticker"]]].dropna()
-            corr_matrix = price_panel.pct_change().dropna().corr()
-            n_names = len(corr_matrix)
-            off_diag_sum = corr_matrix.values.sum() - n_names
-            avg_corr = off_diag_sum / (n_names * (n_names - 1))
-            top.attrs["avg_pairwise_correlation"] = round(float(avg_corr), 2)
-            top.attrs["high_concentration_warning"] = avg_corr > 0.6
+        if len(eligible_df) > 1:
+            names = [x + ".NS" for x in eligible_df["Ticker"]]
+            panel = data[names].dropna()
+            corr = panel.pct_change().dropna().corr()
+            n = len(corr)
+            avg_corr = (corr.values.sum() - n) / (n * (n - 1)) if n > 1 else None
+            eligible_df.attrs["avg_pairwise_correlation"] = round(float(avg_corr), 2) if avg_corr is not None else None
+            eligible_df.attrs["high_concentration_warning"] = bool(avg_corr is not None and avg_corr > 0.60)
         else:
-            top.attrs["avg_pairwise_correlation"] = None
-            top.attrs["high_concentration_warning"] = False
+            eligible_df.attrs["avg_pairwise_correlation"] = None
+            eligible_df.attrs["high_concentration_warning"] = False
 
-        # --- Intraday profit-booking lean per pick, combining today's
-        # RSI level, statistical significance of the move, and how
-        # stretched price is from its own fast EMA.
-        top["Intraday_Tier"] = ""
-        top["Intraday_Action"] = ""
-        for idx, row in top.iterrows():
+        eligible_df["Intraday_Tier"] = ""
+        eligible_df["Intraday_Action"] = ""
+        for idx, row in eligible_df.iterrows():
             rec = self.get_intraday_recommendation(row)
-            top.at[idx, "Intraday_Tier"] = rec["Tier"]
-            top.at[idx, "Intraday_Action"] = rec["Action"]
-
-        return top
+            eligible_df.at[idx, "Intraday_Tier"] = rec["Tier"]
+            eligible_df.at[idx, "Intraday_Action"] = rec["Action"]
+        return eligible_df
 
     def get_intraday_recommendation(self, row: pd.Series) -> dict:
-        """
-        Turns a stock's already-computed factors into an intraday
-        profit-booking lean, using the same "count the caution flags"
-        approach as the IPO analyzer, so the two sections of the alert
-        reason about risk consistently.
-
-        Caution flags, each contributing one point:
-          1. RSI >= intraday_overbought_rsi: elevated zone where
-             short-term pullbacks / consolidation are common.
-          2. Extension_From_EMA_Pct >= intraday_extended_pct: price has
-             run meaningfully ahead of its own recent average, which
-             historically raises mean-reversion risk (read relative to
-             the stock's own daily volatility, since "6% stretch" means
-             very different things for a low-vol large-cap vs. a
-             high-vol small-cap).
-          3. Momentum_Significant is False: today's move isn't
-             statistically distinguishable from that stock's own daily
-             noise, so there's no strong statistical basis to expect it
-             to persist through the session.
-
-        More flags -> stronger lean toward booking profit rather than
-        holding for further continuation. This is a heuristic reasoning
-        aid, not a signal with a demonstrated hit rate -- treat the tier
-        as a structured way to weigh the same factors you'd look at
-        anyway, not as a rule to follow mechanically.
-        """
+        """Exit guidance based on the same short-term model variables."""
         cfg = self.cfg
-        rsi = row["RSI"]
-        significant = bool(row.get("Momentum_Significant", False))
-        extension_pct = row.get("Extension_From_EMA_Pct", 0.0) or 0.0
-        daily_vol_pct = row.get("Daily_Vol_Pct", None)
-        trend_aligned = bool(row.get("Trend_Aligned", False))
+        rsi = float(row.get("RSI", 50))
+        extension = float(row.get("Extension_From_EMA_Pct", 0))
+        ext_vol = float(row.get("Extension_vs_Vol", 99))
+        pred = float(row.get("Predicted_3D_Return_Pct", 0))
+        prob = float(row.get("Probability_Up_3D_Pct", 50))
 
-        overbought = rsi >= cfg.intraday_overbought_rsi
-        extended = extension_pct >= cfg.intraday_extended_pct
-
-        reasons = []
-        if overbought:
-            reasons.append(
-                f"RSI at {rsi} is in an elevated zone (>= {cfg.intraday_overbought_rsi}) "
-                "where short-term pauses or pullbacks are common."
-            )
-        if extended:
-            vol_note = f" (vs. a typical daily move of ~{daily_vol_pct}% for this name)" if daily_vol_pct else ""
-            reasons.append(
-                f"Price is {extension_pct:.1f}% above its fast EMA{vol_note} -- "
-                "a stretch that historically raises mean-reversion risk."
-            )
-        if not significant:
-            reasons.append(
-                "The recent move isn't statistically distinguishable from this "
-                "stock's own daily noise, so there's limited statistical basis "
-                "to expect it to extend through the session."
-            )
-        if trend_aligned and significant and not overbought and not extended:
-            reasons.append(
-                "Trend alignment and statistically-supported momentum, with "
-                "price not yet stretched, together favor letting a trailing "
-                "stop manage the exit rather than booking outright."
-            )
-
-        caution_count = sum([overbought, extended, not significant])
-
-        if caution_count >= 2:
-            tier = "LEAN: BOOK MOST/ALL INTRADAY"
-            action = (
-                "Multiple caution signals are stacked together. A risk-aware "
-                "approach commonly used in this situation is booking most or "
-                "all of the position into intraday strength rather than "
-                "assuming the move continues into the next session."
-            )
-        elif caution_count == 1:
-            tier = "LEAN: PARTIAL BOOKING + TRAIL STOP"
-            action = (
-                "One caution flag is present. Booking part of the position "
-                "and trailing a stop (e.g. near the fast EMA) on the "
-                "remainder is a common middle path -- it locks in some gain "
-                "while leaving room if the move continues."
-            )
-        else:
-            tier = "LEAN: HOLD WITH TRAILING STOP"
-            action = (
-                "No major caution flags today -- RSI, statistical "
-                "significance, and trend all lean supportive. Holding with "
-                "a trailing stop (rather than a fixed target) is a common "
-                "way to stay with the position without giving back the "
-                "full gain if sentiment reverses."
-            )
-
-        return {"Tier": tier, "Action": action, "Reasons": reasons}
+        if rsi >= cfg.intraday_overbought_rsi or ext_vol > 1.0:
+            return {
+                "Tier": "TAKE PARTIAL + TRAIL",
+                "Action": f"Model still expects +{pred:.2f}% over ~3 sessions, but the setup is getting stretched. Book part into strength and trail the rest; do not add after a sharp extension.",
+            }
+        return {
+            "Tier": "HOLD WITH TRAILING STOP",
+            "Action": f"3-session model estimate +{pred:.2f}% with {prob:.1f}% positive-return probability. Use a trailing stop rather than a fixed profit target; invalidate if price loses the short-term trend.",
+        }
 
     # ---- Notification ----------------------------------------------------
 
@@ -1023,27 +1031,27 @@ class AdvancedMarketEngine:
             f"Ann. Volatility: {gold_info['Ann_Volatility_Pct']}%",
             f"Signal: {gold_info['Signal']}",
             "",
-            "--- TOP QUANT PICKS (~6mo momentum, skip 1mo -- see notes) ---",
+            "--- TOP SHORT-TERM MODEL PICKS (~3 trading sessions) ---",
         ]
         for i, row in picks_df.iterrows():
-            sig_note = "sig." if row.get("Momentum_Significant") else "noise-level"
+            if row.get("No_Trade"):
+                lines.append("NO TRADE -- no candidate cleared the short-term confidence filters.")
+                continue
             lines.append(
                 f"{i + 1}. {row['Ticker']} | Rs.{row['Price']} | "
-                f"~6mo mom (skip 1mo): {row['Medium_Momentum_Pct']}% ({sig_note}) | "
-                f"RSI: {row['RSI']} | Score: {row['Composite_Score']}"
+                f"3D model return: {row['Predicted_3D_Return_Pct']}% | "
+                f"P(up): {row['Probability_Up_3D_Pct']}% | "
+                f"Expected edge: {row['Expected_Edge_Pct']}% | RSI: {row['RSI']}"
             )
-            short_mom = row.get("Short_Momentum_Pct")
-            if short_mom is not None:
-                lines.append(f"   {cfg.short_momentum_lookback_days}D move: {short_mom}% (context/caution only, not ranked on)")
-            ext = row.get("Extension_From_EMA_Pct")
-            vol = row.get("Daily_Vol_Pct")
-            if ext is not None:
-                vol_note = f" | typical daily move ~{vol}%" if vol else ""
-                lines.append(f"   Extension from EMA: {ext}%{vol_note}")
+            lines.append(
+                f"   Relative 5D: {row['Relative_5D_Pct']}% | "
+                f"EMA extension: {row['Extension_From_EMA_Pct']}% "
+                f"({row['Extension_vs_Vol']}x 20D vol)"
+            )
             tier = row.get("Intraday_Tier")
             action = row.get("Intraday_Action")
             if tier:
-                lines.append(f"   INTRADAY: {tier}")
+                lines.append(f"   ACTION: {tier}")
                 lines.append(f"   -> {action}")
         avg_corr = picks_df.attrs.get("avg_pairwise_correlation")
         if avg_corr is not None:
@@ -1083,8 +1091,7 @@ class AdvancedMarketEngine:
 
         lines.append("")
         lines.append(
-            "_Screen + GMP read only: no backtest, GMP is unofficial/unregulated. "
-            "Not investment advice._"
+            "_Short-term model is a probabilistic screen, not a guarantee. GMP is unofficial/unregulated. Not investment advice._"
         )
 
         message = "\n".join(lines)
@@ -1102,201 +1109,155 @@ class AdvancedMarketEngine:
 
 def backtest_stock_strategy(
     cfg: EngineConfig,
-    period: str = "2y",
-    start_offset_days: int = 200,
-    forward_horizons: tuple = (1, 3, 5, 10),
+    period: str = "3y",
+    start_offset_days: int = 650,
+    forward_horizons: tuple = (1, 3, 5),
 ) -> tuple:
     """
-    Replays get_multi_factor_stock_picks()'s exact logic (medium-term
-    momentum, RSI screen, trend alignment, z-score composite) on every
-    historical trading day in the backtest window, using ONLY data that
-    would have been available up to that day (no look-ahead), then
-    checks what actually happened over the following 1/3/5/10 trading
-    days. This is what turns "no backtest included" from a disclaimer
-    into an answerable question.
+    Walk-forward test of the NEW short-term model.
 
-    Returns (trades_df, summary_dict). trades_df has one row per
-    historical pick with its forward returns; summary_dict aggregates
-    hit rate and average return per horizon, plus a same-period Nifty 50
-    buy-and-hold comparison so you can see whether the strategy actually
-    added anything over just holding the index.
-
-    Honest limitations of this backtest (read before trusting the output):
-      - No transaction costs, slippage, brokerage, or STT are modeled --
-        real returns will be lower, especially for short holding periods.
-      - No position sizing / capital constraints -- assumes you could
-        take every signal at full size, which isn't realistic.
-      - Survivorship bias: cfg.stock_universe is today's list of liquid
-        names, not the actual historical Nifty-100 constituents on each
-        past date -- names that were removed from the index (due to
-        underperformance, among other reasons) aren't in the test.
-      - Single-market, single-universe test -- statistical significance
-        of the aggregate hit rate should be checked (e.g. is it
-        meaningfully different from 50% given the sample size?) rather
-        than eyeballed.
+    Critical difference from the old backtest: the model is fitted only on
+    samples whose forward outcome was already known at the prediction date.
+    A trade is taken only when the model's predicted return, direction
+    probability, trend and anti-chasing filters all agree.  Days with no
+    qualifying candidate are NO-TRADE days and count in the opportunity log.
     """
-    log.info("Downloading %s of history for %d tickers for backtest...", period, len(cfg.stock_universe))
-    data = download_with_retries(
-        cfg.stock_universe, period=period, interval="1d",
-        retries=cfg.download_retries, backoff_sec=cfg.retry_backoff_sec,
-    )
+    log.info("Downloading %s of history for short-term walk-forward test...", period)
+    data = download_with_retries(cfg.stock_universe, period=period, interval="1d",
+                                 retries=cfg.download_retries, backoff_sec=cfg.retry_backoff_sec)
+    market_data = download_with_retries([cfg.regime_index_ticker], period=period, interval="1d",
+                                        retries=cfg.download_retries, backoff_sec=cfg.retry_backoff_sec)
+    market = market_data[cfg.regime_index_ticker] if cfg.regime_index_ticker in market_data.columns else market_data.iloc[:, 0]
+    market = market.dropna()
 
-    # Precompute full indicator series per ticker (vectorized), so the
-    # per-day loop below is just lookups, not recomputation.
-    indicators = {}
+    feature_frames = {}
     for ticker in cfg.stock_universe:
-        if ticker not in data.columns:
+        if ticker in data.columns:
+            s = data[ticker].dropna()
+            if len(s) >= start_offset_days + cfg.short_horizon_days + 50:
+                feature_frames[ticker] = build_short_term_features(s, market, cfg)
+    if not feature_frames:
+        raise ValueError("Insufficient historical data for backtest.")
+
+    common_dates = sorted(set.intersection(*[set(f.index) for f in feature_frames.values()]))
+    test_dates = common_dates[start_offset_days:-max(forward_horizons)]
+    trades = []
+    no_trade_days = 0
+    last_fit_date = None
+    return_model = direction_model = None
+    rmse = None
+
+    for i, dt in enumerate(test_dates):
+        # Refit periodically. Five sessions is a practical compromise between
+        # adaptation and runtime; live alerts fit on the full latest dataset.
+        if return_model is None or last_fit_date is None or (i % cfg.model_retrain_every_days == 0):
+            training_parts = []
+            cutoff = dt
+            for ticker, f in feature_frames.items():
+                hist = f[f["target_date"] < cutoff].tail(cfg.model_lookback_days)
+                training_parts.append(hist)
+            training = pd.concat(training_parts, ignore_index=True)
+            return_model, direction_model, rmse = fit_short_term_models(training, cfg)
+            last_fit_date = dt
+        if return_model is None:
+            no_trade_days += 1
             continue
+
+        candidates = []
+        for ticker, f in feature_frames.items():
+            if dt not in f.index:
+                continue
+            row = f.loc[[dt]]
+            x = row[MODEL_FEATURES].replace([np.inf, -np.inf], np.nan)
+            if x.isna().any(axis=1).iloc[0]:
+                continue
+            pred = float(return_model.predict(x)[0])
+            prob = float(direction_model.predict_proba(x)[0, 1])
+            rsi = float(row["rsi14"].iloc[0])
+            vol = float(row["vol20"].iloc[0])
+            ext = float(row["dist_ema20"].iloc[0])
+            rel5 = float(row["relative_5"].iloc[0])
+            trend = bool(row["dist_ema20"].iloc[0] > 0 and row["dist_sma50"].iloc[0] > 0 and row["ema20_slope10"].iloc[0] > 0)
+            market_ok = bool(row["market_above_sma50"].iloc[0] > 0 and row["market_sma50_slope10"].iloc[0] > 0)
+            ext_vol = ext / vol if vol > 0 else 99
+            eligible = (pred * 100 >= cfg.min_pred_return_pct and prob >= cfg.min_prob_up and
+                        cfg.rsi_min <= rsi <= cfg.rsi_max and ext_vol <= cfg.max_extension_vol_multiple and
+                        rel5 * 100 >= cfg.min_relative_strength_5d_pct and trend and market_ok)
+            edge = pred * (2 * prob - 1) - max(0, (rmse or 0) * 0.35)
+            candidates.append((eligible, edge, ticker, pred, prob, rsi, ext_vol, rel5, row))
+
+        eligible = [x for x in candidates if x[0]]
+        if not eligible:
+            no_trade_days += 1
+            continue
+        eligible.sort(key=lambda x: (x[1], x[4]), reverse=True)
+        # For a profit-focused short-term test, use one highest-conviction name
+        # rather than silently multiplying correlated bets.
+        chosen = eligible[0]
+        _, edge, ticker, pred, prob, rsi, ext_vol, rel5, row = chosen
         s = data[ticker].dropna()
-        if len(s) < cfg.medium_momentum_lookback_days + cfg.medium_momentum_skip_days + start_offset_days:
-            continue
-        indicators[ticker] = {
-            "price": s,
-            "ema_fast": s.ewm(span=cfg.ema_fast, adjust=False).mean(),
-            "sma_slow": s.rolling(cfg.sma_slow).mean(),
-            "rsi": wilders_rsi_series(s, cfg.rsi_period),
+        idx = s.index.get_loc(dt)
+        entry = float(s.iloc[idx])
+        trade = {
+            "Date": dt, "Ticker": ticker, "Entry_Price": entry,
+            "Predicted_3D_Return_Pct": round(pred * 100, 2),
+            "Probability_Up_3D_Pct": round(prob * 100, 1),
+            "Expected_Edge_Pct": round(edge * 100, 2),
+            "RSI": round(rsi, 1), "Extension_vs_Vol": round(ext_vol, 2),
+            "Relative_5D_Pct": round(rel5 * 100, 2),
         }
+        for h in forward_horizons:
+            trade[f"Fwd_{h}d_Pct"] = round(((float(s.iloc[idx + h]) - entry) / entry) * 100, 2) if idx + h < len(s) else np.nan
+        trades.append(trade)
 
-    if not indicators:
-        raise ValueError("Not enough historical data to backtest -- try a longer 'period'.")
-
-    # Common date index across all tickers with enough history.
-    all_dates = sorted(set().union(*[set(ind["price"].index) for ind in indicators.values()]))
-    test_dates = all_dates[start_offset_days:-max(forward_horizons)]
-    log.info("Backtesting over %d historical trading days...", len(test_dates))
-
-    trade_rows = []
-    for dt in test_dates:
-        day_rows = []
-        for ticker, ind in indicators.items():
-            price_series = ind["price"]
-            if dt not in price_series.index:
-                continue
-            idx = price_series.index.get_loc(dt)
-            if idx < cfg.medium_momentum_lookback_days + cfg.medium_momentum_skip_days:
-                continue
-
-            price = price_series.iloc[idx]
-            ema = ind["ema_fast"].iloc[idx]
-            sma = ind["sma_slow"].iloc[idx]
-            rsi = ind["rsi"].iloc[idx]
-            if pd.isna(ema) or pd.isna(sma) or pd.isna(rsi):
-                continue
-            if rsi > cfg.rsi_max or rsi < cfg.rsi_min:
-                continue
-
-            skip = cfg.medium_momentum_skip_days
-            look = cfg.medium_momentum_lookback_days
-            p_start = price_series.iloc[idx - look - skip]
-            p_end = price_series.iloc[idx - skip]
-            medium_mom = ((p_end - p_start) / p_start) * 100
-
-            trend_aligned = price > ema > sma
-
-            day_rows.append({
-                "Date": dt, "Ticker": ticker, "Idx": idx, "Price": price,
-                "RSI": rsi, "Medium_Momentum_Pct": medium_mom, "Trend_Aligned": trend_aligned,
-            })
-
-        if len(day_rows) < 3:
-            continue
-        day_df = pd.DataFrame(day_rows)
-        day_df["z_momentum"] = zscore(day_df["Medium_Momentum_Pct"])
-        day_df["z_rsi_quality"] = zscore(-(day_df["RSI"] - 60).abs())
-        day_df["z_trend"] = zscore(day_df["Trend_Aligned"].astype(float))
-        day_df["Composite_Score"] = 0.4 * day_df["z_momentum"] + 0.35 * day_df["z_rsi_quality"] + 0.25 * day_df["z_trend"]
-
-        top = day_df.sort_values("Composite_Score", ascending=False).head(cfg.top_n)
-
-        for _, row in top.iterrows():
-            price_series = indicators[row["Ticker"]]["price"]
-            idx = int(row["Idx"])
-            entry_price = row["Price"]
-            trade = {
-                "Date": dt, "Ticker": row["Ticker"], "Entry_Price": entry_price,
-                "RSI": round(row["RSI"], 1), "Medium_Momentum_Pct": round(row["Medium_Momentum_Pct"], 2),
-                "Composite_Score": round(row["Composite_Score"], 3),
-            }
-            for h in forward_horizons:
-                if idx + h < len(price_series):
-                    fwd_price = price_series.iloc[idx + h]
-                    trade[f"Fwd_{h}d_Pct"] = round(((fwd_price - entry_price) / entry_price) * 100, 2)
-                else:
-                    trade[f"Fwd_{h}d_Pct"] = np.nan
-            trade_rows.append(trade)
-
-    trades_df = pd.DataFrame(trade_rows)
+    trades_df = pd.DataFrame(trades)
     if trades_df.empty:
-        raise ValueError("Backtest produced no trades -- check universe/date range.")
+        raise ValueError("No qualifying trades were found. That is preferable to forcing false positives, but review thresholds/model fit.")
 
-    # --- Benchmark: Nifty 50 buy-and-hold over the same test window ---
-    try:
-        bench_data = download_with_retries(
-            [cfg.regime_index_ticker], period=period, interval="1d",
-            retries=cfg.download_retries, backoff_sec=cfg.retry_backoff_sec,
-        )
-        bench_series = bench_data[cfg.regime_index_ticker] if cfg.regime_index_ticker in bench_data.columns else bench_data.iloc[:, 0]
-        bench_series = bench_series.dropna()
-        bench_start = bench_series.loc[bench_series.index >= test_dates[0]].iloc[0]
-        bench_end = bench_series.iloc[-1]
-        bench_return_pct = round(((bench_end - bench_start) / bench_start) * 100, 2)
-    except Exception as e:  # noqa: BLE001
-        log.warning("Benchmark fetch failed: %s", e)
-        bench_return_pct = None
-
-    summary = {"n_trades": len(trades_df), "nifty50_buyhold_pct_same_window": bench_return_pct}
+    summary = {
+        "n_trades": len(trades_df),
+        "no_trade_days": no_trade_days,
+        "test_days": len(test_dates),
+        "trade_rate_pct": round(100 * len(trades_df) / max(1, len(test_dates)), 1),
+    }
     for h in forward_horizons:
-        col = f"Fwd_{h}d_Pct"
-        valid = trades_df[col].dropna()
+        valid = trades_df[f"Fwd_{h}d_Pct"].dropna()
         if len(valid) == 0:
             continue
-        hit_rate = float((valid > 0).mean() * 100)
-        avg_return = float(valid.mean())
-        std_return = float(valid.std(ddof=1)) if len(valid) > 1 else 0.0
-        # One-sample t-test: is the average return significantly different
-        # from zero, given the sample size and observed dispersion?
-        if std_return > 0 and len(valid) > 1:
-            se = std_return / np.sqrt(len(valid))
-            t_stat = avg_return / se
-            p_val = float(2 * (1 - t_dist.cdf(abs(t_stat), df=len(valid) - 1)))
-        else:
-            p_val = 1.0
-        summary[f"{h}d_hit_rate_pct"] = round(hit_rate, 1)
-        summary[f"{h}d_avg_return_pct"] = round(avg_return, 2)
-        summary[f"{h}d_return_p_value"] = round(p_val, 3)
+        summary[f"{h}d_hit_rate_pct"] = round(float((valid > 0).mean() * 100), 1)
+        summary[f"{h}d_avg_return_pct"] = round(float(valid.mean()), 2)
+        summary[f"{h}d_median_return_pct"] = round(float(valid.median()), 2)
+        summary[f"{h}d_worst_return_pct"] = round(float(valid.min()), 2)
+        summary[f"{h}d_best_return_pct"] = round(float(valid.max()), 2)
         summary[f"{h}d_n"] = len(valid)
 
+    # Same-window Nifty benchmark is retained for context.
+    try:
+        bench = market
+        b0 = bench.loc[bench.index >= test_dates[0]].iloc[0]
+        b1 = bench.loc[bench.index <= test_dates[-1]].iloc[-1]
+        summary["nifty50_buyhold_pct_same_window"] = round(float((b1 / b0 - 1) * 100), 2)
+    except Exception:
+        summary["nifty50_buyhold_pct_same_window"] = None
     return trades_df, summary
 
 
 def print_backtest_report(trades_df: pd.DataFrame, summary: dict):
-    print("\n" + "=" * 70)
-    print("BACKTEST REPORT -- walk-forward simulation, no look-ahead")
-    print("=" * 70)
-    print(f"Total historical picks tested: {summary['n_trades']}")
+    print("\n" + "=" * 78)
+    print("SHORT-TERM MODEL BACKTEST -- walk-forward / no look-ahead")
+    print("=" * 78)
+    print(f"Test days: {summary.get('test_days')} | Trades: {summary.get('n_trades')} | NO-TRADE days: {summary.get('no_trade_days')} | Trade rate: {summary.get('trade_rate_pct')}%")
     if summary.get("nifty50_buyhold_pct_same_window") is not None:
-        print(f"Nifty 50 buy-and-hold return over same window: {summary['nifty50_buyhold_pct_same_window']}%")
-    print("-" * 70)
-    print(f"{'Horizon':<10}{'Hit Rate':<12}{'Avg Return':<14}{'p-value':<10}{'N':<6}")
-    for h in (1, 3, 5, 10):
+        print(f"Nifty 50 buy-and-hold over test window: {summary['nifty50_buyhold_pct_same_window']}%")
+    print("-" * 78)
+    print(f"{'Horizon':<10}{'Hit Rate':<12}{'Avg':<10}{'Median':<10}{'Worst':<10}{'Best':<10}{'N':<6}")
+    for h in (1, 3, 5):
         if f"{h}d_hit_rate_pct" not in summary:
             continue
-        sig = "*" if summary[f"{h}d_return_p_value"] < 0.05 else " "
-        print(
-            f"{h}d{sig:<8}"
-            f"{summary[f'{h}d_hit_rate_pct']}%{'':<6}"
-            f"{summary[f'{h}d_avg_return_pct']}%{'':<8}"
-            f"{summary[f'{h}d_return_p_value']:<10}"
-            f"{summary[f'{h}d_n']}"
-        )
-    print("-" * 70)
-    print("* = average return statistically distinguishable from zero at p<0.05")
-    print(
-        "\nReminder: no transaction costs/slippage modeled, and cfg.stock_universe\n"
-        "is today's liquid-names list applied retroactively (survivorship bias),\n"
-        "not the actual historical index constituents on each test date."
-    )
-    print("=" * 70 + "\n")
+        print(f"{h}d{'':<7}{summary[f'{h}d_hit_rate_pct']}%{'':<7}{summary[f'{h}d_avg_return_pct']}%{'':<7}{summary[f'{h}d_median_return_pct']}%{'':<7}{summary[f'{h}d_worst_return_pct']}%{'':<7}{summary[f'{h}d_best_return_pct']}%{'':<6}{summary[f'{h}d_n']}")
+    print("-" * 78)
+    print("IMPORTANT: optimize only on a training period, then judge the final model on a completely untouched out-of-sample period. Transaction costs, slippage and taxes are not modeled.")
+    print("=" * 78 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -1421,7 +1382,7 @@ if __name__ == "__main__":
         help="Run a walk-forward historical backtest instead of sending a live alert.",
     )
     parser.add_argument(
-        "--backtest-period", default="2y",
+        "--backtest-period", default="3y",
         help="How much history to backtest over (yfinance period string, e.g. '1y', '2y'). Default: 2y.",
     )
     args = parser.parse_args()
@@ -1455,14 +1416,12 @@ if __name__ == "__main__":
     except Exception as e:  # noqa: BLE001
         log.warning("Stock screen failed (%s); using single fallback pick.", e)
         stock_picks = pd.DataFrame([{
-            "Ticker": "RELIANCE", "Price": 1334.80, "Short_Momentum_Pct": 2.06,
-            "Medium_Momentum_Pct": 4.5,
-            "RSI": 58.4, "EMA_Fast": 1301.00, "SMA_Slow": 1290.00,
-            "Trend_Aligned": True, "Above_Fast_EMA": True, "Composite_Score": 0.0,
-            "Momentum_P_Value": 1.0, "Momentum_Significant": False,
-            "Extension_From_EMA_Pct": 0.0, "Daily_Vol_Pct": None,
-            "Intraday_Tier": "LEAN: HOLD WITH TRAILING STOP", "Intraday_Action": "Fallback data.",
+            "Ticker": "--", "Price": np.nan, "No_Trade": True,
+            "Intraday_Tier": "NO TRADE",
+            "Intraday_Action": "Short-term model failed to produce a validated prediction. Preserve capital; do not substitute a hard-coded stock.",
         }])
+        stock_picks.attrs["avg_pairwise_correlation"] = None
+        stock_picks.attrs["high_concentration_warning"] = False
 
     engine.log_alert_history(stock_picks, regime)
 
