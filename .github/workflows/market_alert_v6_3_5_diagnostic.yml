@@ -1,0 +1,59 @@
+name: Market Alert V6.3.5 Diagnostic Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  diagnostic-backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements_v6_3_5.txt
+
+      - name: Install V6.3.5 dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements_v6_3_5.txt
+
+      - name: Validate V6.3.5 syntax
+        run: |
+          python -m py_compile backtest_v6_3_5.py
+
+      - name: Run V6.3.5 diagnostic backtest
+        run: |
+          python backtest_v6_3_5.py
+
+      - name: Upload V6.3.5 audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: V6.3.5-diagnostic-results
+          path: audit/
+          if-no-files-found: warn
+
+      - name: Save V6.3.5 audit files to repository
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add audit/ || true
+
+          if git diff --cached --quiet; then
+            echo "No audit changes to commit."
+          else
+            git commit -m "Add V6.3.5 diagnostic backtest audit"
+            git push
+          fi
