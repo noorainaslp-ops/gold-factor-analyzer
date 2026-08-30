@@ -18,63 +18,74 @@ jobs:
 
     steps:
 
-      # ------------------------------------------------------
-      # CHECKOUT
-      # ------------------------------------------------------
+      # ======================================================
+      # 1. CHECKOUT REPOSITORY
+      # ======================================================
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------
-      # PYTHON
-      # ------------------------------------------------------
+      # ======================================================
+      # 2. SET UP PYTHON
+      # ======================================================
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
+          cache-dependency-path: requirements_v6_3.txt
 
-      # ------------------------------------------------------
-      # DEPENDENCIES
-      # ------------------------------------------------------
+      # ======================================================
+      # 3. INSTALL DEPENDENCIES
+      # ======================================================
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements_v6_3.txt
+          python -m pip install -r requirements_v6_3.txt
 
-      # ------------------------------------------------------
-      # VERIFY FILES
-      # ------------------------------------------------------
+      # ======================================================
+      # 4. VERIFY REQUIRED FILES
+      # ======================================================
 
       - name: Verify V6.3 files
         run: |
-          echo "Repository:"
+          echo "======================================"
+          echo "REPOSITORY CONTENT"
+          echo "======================================"
           pwd
-          echo ""
-          echo "Files:"
           ls -la
+
           echo ""
-          echo "Workflow files:"
+          echo "======================================"
+          echo "WORKFLOW DIRECTORY"
+          echo "======================================"
           ls -la .github/workflows
+
           echo ""
+          echo "======================================"
+          echo "CHECKING V6.3 FILES"
+          echo "======================================"
+
           test -f market_engine_v6_3.py
           test -f requirements_v6_3.txt
-          echo "V6.3 files found."
 
-      # ------------------------------------------------------
-      # PYTHON SYNTAX VALIDATION
-      # ------------------------------------------------------
+          echo "market_engine_v6_3.py FOUND"
+          echo "requirements_v6_3.txt FOUND"
+
+      # ======================================================
+      # 5. VALIDATE PYTHON SYNTAX
+      # ======================================================
 
       - name: Validate Market Engine V6.3
         run: |
           python -m py_compile market_engine_v6_3.py
-          echo "V6.3 syntax validation passed."
+          echo "V6.3 syntax validation PASSED."
 
-      # ------------------------------------------------------
-      # RUN MARKET ENGINE
-      # ------------------------------------------------------
+      # ======================================================
+      # 6. RUN MARKET ENGINE
+      # ======================================================
 
       - name: Run Market Alert V6.3
         env:
@@ -84,23 +95,41 @@ jobs:
         run: |
           python market_engine_v6_3.py
 
-      # ------------------------------------------------------
-      # SAVE AUDIT HISTORY
-      # ------------------------------------------------------
+      # ======================================================
+      # 7. SHOW GENERATED FILES
+      # ======================================================
+
+      - name: Show generated files
+        if: always()
+        run: |
+          echo "======================================"
+          echo "GENERATED FILES"
+          echo "======================================"
+
+          ls -lah
+
+          echo ""
+          echo "CSV files:"
+          ls -lah *.csv 2>/dev/null || true
+
+      # ======================================================
+      # 8. SAVE AUDIT HISTORY
+      # ======================================================
 
       - name: Save audit history
+        if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add \
-            alert_history_v6_3.csv \
-            candidate_history_v6_3.csv \
-            rejected_candidates_v6_3.csv \
-            backtest_v6_3.csv \
-            2>/dev/null || true
+          git add alert_history_v6_3.csv 2>/dev/null || true
+          git add candidate_history_v6_3.csv 2>/dev/null || true
+          git add rejected_candidates_v6_3.csv 2>/dev/null || true
+          git add backtest_v6_3.csv 2>/dev/null || true
 
-          git diff --cached --quiet || \
+          if git diff --cached --quiet; then
+            echo "No history changes to commit."
+          else
             git commit -m "Update V6.3 market alert history"
-
-          git push || true
+            git push
+          fi
