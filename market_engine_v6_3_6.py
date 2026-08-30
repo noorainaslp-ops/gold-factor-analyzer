@@ -1,34 +1,29 @@
 """
-MARKET ALERT V6.3.6
-CALIBRATED SHORT-TERM MARKET SCREENER
+============================================================
+MULTI-FACTOR MARKET ALERT V6.3.6
+============================================================
 
-Purpose
--------
-Generate short-term Indian equity opportunities for approximately
-1-5 trading sessions.
+Short-term Indian equity research screener.
 
-V6.3.6 features
----------------
-- Correct market-regime handling.
-- MIXED regime is not automatically rejected.
-- Separates raw probability from calibrated probability.
-- Empirical analogue model.
-- Expected return is used as an important trade criterion.
-- Risk/reward calculated from valid positive stop/target levels.
-- Never produces a negative stop loss.
-- TRADE / WATCH / REJECT classification.
-- Position sizing based on configured capital and risk.
-- Weekend/non-trading-day handling.
-- Conservative IPO retrieval.
-- Telegram alert generation.
-- Audit CSV generation.
+Main objectives:
+- 3-session and 5-session empirical probability
+- Expected return estimation
+- Risk/reward calculation
+- Position sizing
+- Market regime awareness
+- TRADE / WATCH / REJECT classification
+- Weekend protection
+- IPO retrieval
+- Telegram alerts
+- CSV audit trail
 
-IMPORTANT
----------
-This is a probabilistic research screen.
+IMPORTANT:
+This is a probabilistic research model.
 It does not guarantee profit.
+
 P(UP) is an empirical/calibrated estimate,
 not a guaranteed probability of profit.
+============================================================
 """
 
 from __future__ import annotations
@@ -40,34 +35,118 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import requests
+import yfinance as yf
 
 
 # ============================================================
-# CONFIGURATION
+# VERSION
 # ============================================================
 
 VERSION = "V6.3.6"
 
-CAPITAL = float(
-    os.getenv(
-        "TRADING_CAPITAL",
-        "100000"
-    )
+
+# ============================================================
+# SAFE ENVIRONMENT VARIABLES
+# ============================================================
+
+def safe_env_float(name, default):
+    """
+    Safely read a numeric environment variable.
+
+    GitHub Actions can provide an environment variable as an
+    empty string. float("") raises ValueError.
+
+    This function therefore safely handles:
+    - missing variable
+    - empty variable
+    - invalid text
+    - NaN
+    - infinity
+    """
+
+    raw = os.getenv(name)
+
+    if raw is None:
+        return float(default)
+
+    raw = str(raw).strip()
+
+    if raw == "":
+        return float(default)
+
+    try:
+
+        value = float(raw)
+
+        if not math.isfinite(value):
+            return float(default)
+
+        return value
+
+    except (TypeError, ValueError):
+
+        print(
+            f"WARNING: Invalid {name}={raw!r}. "
+            f"Using default {default}."
+        )
+
+        return float(default)
+
+
+# ============================================================
+# CAPITAL / RISK CONFIGURATION
+# ============================================================
+
+# Default capital = ₹1,00,000
+CAPITAL = safe_env_float(
+    "TRADING_CAPITAL",
+    100000
 )
 
-MAX_RISK_PCT = float(
-    os.getenv(
-        "MAX_RISK_PCT",
-        "0.01"
-    )
+# Default maximum risk per trade = 1%
+MAX_RISK_PCT = safe_env_float(
+    "MAX_RISK_PCT",
+    0.01
 )
 
-ROUND_TRIP_COST = 0.0015
+# Safety checks
+if CAPITAL <= 0:
+
+    print(
+        "WARNING: TRADING_CAPITAL must be positive."
+    )
+
+    CAPITAL = 100000
+
+
+if MAX_RISK_PCT <= 0:
+
+    print(
+        "WARNING: MAX_RISK_PCT must be positive."
+    )
+
+    MAX_RISK_PCT = 0.01
+
+
+# Never allow more than 5% configured risk
+if MAX_RISK_PCT > 0.05:
+
+    print(
+        "WARNING: MAX_RISK_PCT above 5%. "
+        "Capping at 5%."
+    )
+
+    MAX_RISK_PCT = 0.05
+
+
+# ============================================================
+# MODEL CONFIGURATION
+# ============================================================
 
 N_ANALOGUES = 30
 MIN_ANALOGUES = 15
+
 LOOKBACK_DAYS = 756
 
 MIN_CALIBRATED_P3 = 0.52
@@ -86,6 +165,7 @@ MAX_TOP_PICKS = 5
 
 AUDIT_DIR = Path("audit")
 AUDIT_DIR.mkdir(
+    parents=True,
     exist_ok=True
 )
 
@@ -159,22 +239,21 @@ SYMBOLS = [
 
 
 # ============================================================
-# HELPERS
+# BASIC HELPERS
 # ============================================================
 
-def ticker(symbol: str) -> str:
+def ticker(symbol):
     return f"{symbol}.NS"
 
 
-def safe_float(
-    value,
-    default=np.nan
-):
-    try:
-        x = float(value)
+def safe_float(value, default=np.nan):
 
-        if np.isfinite(x):
-            return x
+    try:
+
+        value = float(value)
+
+        if np.isfinite(value):
+            return value
 
     except Exception:
         pass
@@ -194,20 +273,26 @@ def clean_date(value):
 
 def is_trading_day():
 
-    now = datetime.now()
+    return datetime.now().weekday() < 5
 
-    return now.weekday() < 5
 
+def format_money(value):
+
+    value = safe_float(value)
+
+    if not np.isfinite(value):
+        return "N/A"
+
+    return f"₹{value:,.2f}"
+
+
+# ============================================================
+# DATA CLEANING
+# ============================================================
 
 def clean_frame(df):
 
     if df is None or df.empty:
-        return None
-
-    if isinstance(
-        df.columns,
-        pd.MultiIndex
-    ):
         return None
 
     required = [
@@ -218,14 +303,15 @@ def clean_frame(df):
         "Volume",
     ]
 
-    for col in required:
+    if isinstance(df.columns, pd.MultiIndex):
+        return None
 
-        if col not in df.columns:
-            df[col] = np.nan
+    for column in required:
 
-    df = df[
-        required
-    ].copy()
+        if column not in df.columns:
+            df[column] = np.nan
+
+    df = df[required].copy()
 
     df.index = pd.to_datetime(
         df.index
@@ -252,30 +338,31 @@ def split_download(raw):
         pd.MultiIndex
     ):
 
-        cleaned = clean_frame(
-            raw
-        )
+        cleaned = clean_frame(raw)
 
         if cleaned is not None:
             result["SINGLE"] = cleaned
 
         return result
 
-    levels0 = list(
+    level0 = list(
         raw.columns
         .get_level_values(0)
         .unique()
     )
 
-    levels1 = list(
+    level1 = list(
         raw.columns
         .get_level_values(1)
         .unique()
     )
 
-    if "Close" in levels0:
+    # Typical yfinance structure:
+    # Price -> ticker
 
-        for name in levels1:
+    if "Close" in level0:
+
+        for name in level1:
 
             try:
 
@@ -286,21 +373,20 @@ def split_download(raw):
                     drop_level=True
                 )
 
-                cleaned = clean_frame(
-                    part
-                )
+                cleaned = clean_frame(part)
 
                 if cleaned is not None:
-                    result[
-                        str(name)
-                    ] = cleaned
+                    result[str(name)] = cleaned
 
             except Exception:
                 continue
 
     else:
 
-        for name in levels0:
+        # Alternative structure:
+        # ticker -> Price
+
+        for name in level0:
 
             try:
 
@@ -311,14 +397,10 @@ def split_download(raw):
                     drop_level=True
                 )
 
-                cleaned = clean_frame(
-                    part
-                )
+                cleaned = clean_frame(part)
 
                 if cleaned is not None:
-                    result[
-                        str(name)
-                    ] = cleaned
+                    result[str(name)] = cleaned
 
             except Exception:
                 continue
@@ -327,7 +409,7 @@ def split_download(raw):
 
 
 # ============================================================
-# TECHNICAL INDICATORS
+# RSI
 # ============================================================
 
 def calculate_rsi(
@@ -366,19 +448,23 @@ def calculate_rsi(
         )
     )
 
-    result = (
+    rsi = (
         100
         -
         100 / (1 + rs)
     )
 
-    result = result.where(
+    rsi = rsi.where(
         avg_loss != 0,
         100.0
     )
 
-    return result
+    return rsi
 
+
+# ============================================================
+# FEATURE ENGINEERING
+# ============================================================
 
 def add_features(df):
 
@@ -592,24 +678,28 @@ def market_regime(
         close.iloc[-1]
     )
 
-    sma_current = safe_float(
+    current_sma50 = safe_float(
         sma50.iloc[-1]
     )
 
-    sma_previous = safe_float(
+    previous_sma50 = safe_float(
         sma50.iloc[-6]
     )
 
     above = (
         np.isfinite(current)
-        and np.isfinite(sma_current)
-        and current >= sma_current
+        and
+        np.isfinite(current_sma50)
+        and
+        current >= current_sma50
     )
 
     rising = (
-        np.isfinite(sma_current)
-        and np.isfinite(sma_previous)
-        and sma_current > sma_previous
+        np.isfinite(current_sma50)
+        and
+        np.isfinite(previous_sma50)
+        and
+        current_sma50 > previous_sma50
     )
 
     if above and rising:
@@ -618,7 +708,8 @@ def market_regime(
 
     elif (
         not above
-        and not rising
+        and
+        not rising
     ):
 
         regime = "UNFAVORABLE"
@@ -642,10 +733,19 @@ def market_regime(
             )
 
     return {
-        "regime": regime,
-        "nifty": current,
-        "sma50": sma_current,
-        "vix": vix_value,
+
+        "regime":
+            regime,
+
+        "nifty":
+            current,
+
+        "sma50":
+            current_sma50,
+
+        "vix":
+            vix_value,
+
     }
 
 
@@ -662,10 +762,7 @@ def analogue_model(
         features.index <= signal_date
     ].copy()
 
-    required = (
-        FEATURES
-        + ["Close"]
-    )
+    required = FEATURES + ["Close"]
 
     data = data.dropna(
         subset=required
@@ -676,6 +773,8 @@ def analogue_model(
 
     candidate = data.iloc[-1]
 
+    # Leave a gap before the current observation so that
+    # future outcomes do not overlap the current signal.
     train = data.iloc[:-6].copy()
 
     if len(train) < 100:
@@ -718,10 +817,7 @@ def analogue_model(
 
         series = train[col]
 
-        median = (
-            series
-            .median()
-        )
+        median = series.median()
 
         mad = (
             series
@@ -730,7 +826,8 @@ def analogue_model(
 
         if (
             np.isfinite(mad)
-            and mad > 0
+            and
+            mad > 0
         ):
 
             scale = (
@@ -739,29 +836,27 @@ def analogue_model(
 
         else:
 
-            scale = (
-                series.std()
-            )
+            scale = series.std()
 
         if (
             not np.isfinite(scale)
-            or scale <= 0
+            or
+            scale <= 0
         ):
 
             scale = 1.0
 
-        candidate_value = (
-            safe_float(
-                candidate[col],
-                median
-            )
+        candidate_value = safe_float(
+            candidate[col],
+            median
         )
 
         distances += (
             (
                 (
                     series.values
-                    - candidate_value
+                    -
+                    candidate_value
                 )
                 /
                 scale
@@ -795,7 +890,8 @@ def analogue_model(
         /
         (
             train["distance"]
-            + 0.10
+            +
+            0.10
         )
     )
 
@@ -853,9 +949,12 @@ def analogue_model(
         0.07
     )
 
+    # Conservative shrinkage toward 50%.
     shrinkage = min(
         0.45,
-        12.0 / max(
+        12.0
+        /
+        max(
             12.0,
             len(train)
         )
@@ -863,22 +962,30 @@ def analogue_model(
 
     calibrated_p3 = (
         (
-            1 - shrinkage
+            1
+            -
+            shrinkage
         )
-        * raw_p3
+        *
+        raw_p3
         +
         shrinkage
-        * 0.50
+        *
+        0.50
     )
 
     calibrated_p5 = (
         (
-            1 - shrinkage
+            1
+            -
+            shrinkage
         )
-        * raw_p5
+        *
+        raw_p5
         +
         shrinkage
-        * 0.50
+        *
+        0.50
     )
 
     dispersion_penalty3 = min(
@@ -899,16 +1006,24 @@ def analogue_model(
     )
 
     quality = (
-        0.40 * sample_quality
+        0.40
+        *
+        sample_quality
         +
-        0.30 * (
+        0.30
+        *
+        (
             1
-            - dispersion_penalty3
+            -
+            dispersion_penalty3
         )
         +
-        0.30 * (
+        0.30
+        *
+        (
             1
-            - dispersion_penalty5
+            -
+            dispersion_penalty5
         )
     )
 
@@ -955,7 +1070,7 @@ def analogue_model(
 
 
 # ============================================================
-# RISK / TARGET LEVELS
+# STOP / TARGET / RISK REWARD
 # ============================================================
 
 def calculate_trade_levels(
@@ -965,21 +1080,10 @@ def calculate_trade_levels(
     er5
 ):
 
-    price = safe_float(
-        price
-    )
-
-    atr_pct = safe_float(
-        atr_pct
-    )
-
-    er3 = safe_float(
-        er3
-    )
-
-    er5 = safe_float(
-        er5
-    )
+    price = safe_float(price)
+    atr_pct = safe_float(atr_pct)
+    er3 = safe_float(er3)
+    er5 = safe_float(er5)
 
     if (
         not np.isfinite(price)
@@ -1003,10 +1107,13 @@ def calculate_trade_levels(
         *
         (
             1
-            - stop_distance
+            -
+            stop_distance
         )
     )
 
+    # Critical safety check:
+    # NEVER allow a negative stop.
     stop = max(
         0.01,
         stop
@@ -1014,12 +1121,15 @@ def calculate_trade_levels(
 
     risk_per_share = (
         price
-        - stop
+        -
+        stop
     )
 
     if risk_per_share <= 0:
         return None
 
+    # Expected return is not a guaranteed target.
+    # Cap targets to avoid unrealistic projections.
     target1_return = max(
         0.0,
         min(
@@ -1041,7 +1151,8 @@ def calculate_trade_levels(
         *
         (
             1
-            + target1_return
+            +
+            target1_return
         )
     )
 
@@ -1050,16 +1161,21 @@ def calculate_trade_levels(
         *
         (
             1
-            + target2_return
+            +
+            target2_return
         )
     )
 
     rr1 = (
-        target1 - price
+        target1
+        -
+        price
     ) / risk_per_share
 
     rr2 = (
-        target2 - price
+        target2
+        -
+        price
     ) / risk_per_share
 
     return {
@@ -1086,7 +1202,7 @@ def calculate_trade_levels(
 
 
 # ============================================================
-# POSITION SIZE
+# POSITION SIZING
 # ============================================================
 
 def position_size(
@@ -1094,18 +1210,15 @@ def position_size(
     stop
 ):
 
-    price = safe_float(
-        price
-    )
-
-    stop = safe_float(
-        stop
-    )
+    price = safe_float(price)
+    stop = safe_float(stop)
 
     if (
         not np.isfinite(price)
-        or not np.isfinite(stop)
-        or price <= stop
+        or
+        not np.isfinite(stop)
+        or
+        price <= stop
     ):
 
         return (
@@ -1122,8 +1235,17 @@ def position_size(
 
     risk_per_share = (
         price
-        - stop
+        -
+        stop
     )
+
+    if risk_per_share <= 0:
+
+        return (
+            0,
+            0.0,
+            0.0
+        )
 
     shares_by_risk = math.floor(
         risk_budget
@@ -1147,12 +1269,14 @@ def position_size(
 
     exposure = (
         shares
-        * price
+        *
+        price
     )
 
     planned_loss = (
         shares
-        * risk_per_share
+        *
+        risk_per_share
     )
 
     return (
@@ -1163,7 +1287,7 @@ def position_size(
 
 
 # ============================================================
-# SCORING
+# SCORE
 # ============================================================
 
 def calculate_score(
@@ -1179,26 +1303,33 @@ def calculate_score(
 
     rsi_value = row["rsi"]
     volume = row["volume_ratio"]
+
     trend = row["trend"]
 
     score = 0.0
 
     score += (
-        p3 - 0.50
+        p3
+        -
+        0.50
     ) * 3.0
 
     score += (
-        p5 - 0.50
+        p5
+        -
+        0.50
     ) * 3.0
 
     score += (
         er3
-        * 20.0
+        *
+        20.0
     )
 
     score += (
         er5
-        * 15.0
+        *
+        15.0
     )
 
     if trend > 0:
@@ -1207,24 +1338,33 @@ def calculate_score(
     if volume >= 1.20:
         score += 0.15
 
-    elif volume >= 1.0:
+    elif volume >= 1.00:
         score += 0.05
 
     if (
-        50 <= rsi_value <= 68
+        50
+        <=
+        rsi_value
+        <=
+        68
     ):
+
         score += 0.10
 
     elif rsi_value > 72:
+
         score -= 0.15
 
     if regime == "FAVORABLE":
+
         score += 0.15
 
     elif regime == "MIXED":
+
         score -= 0.05
 
     elif regime == "UNFAVORABLE":
+
         score -= 0.50
 
     return score
@@ -1277,15 +1417,10 @@ def evaluate_candidate(
     )
 
     levels = calculate_trade_levels(
-
         price,
-
         row["atr_pct"],
-
         er3,
-
         er5
-
     )
 
     if levels is None:
@@ -1296,11 +1431,8 @@ def evaluate_candidate(
         exposure,
         planned_loss
     ) = position_size(
-
         price,
-
         levels["stop"]
-
     )
 
     score = calculate_score(
@@ -1310,16 +1442,16 @@ def evaluate_candidate(
 
     checks = {
 
-        "calibrated_p3":
+        "p3":
             p3 >= MIN_CALIBRATED_P3,
 
-        "calibrated_p5":
+        "p5":
             p5 >= MIN_CALIBRATED_P5,
 
-        "positive_er3":
+        "er3":
             er3 >= MIN_NET_ER3,
 
-        "positive_er5":
+        "er5":
             er5 >= MIN_NET_ER5,
 
         "rr1":
@@ -1353,14 +1485,14 @@ def evaluate_candidate(
     ]
 
     all_pass = all(
-        bool(x)
-        for x in checks.values()
+        bool(value)
+        for value in checks.values()
     )
 
-    watch_score = (
+    pass_rate = (
         sum(
-            bool(x)
-            for x in checks.values()
+            bool(value)
+            for value in checks.values()
         )
         /
         len(checks)
@@ -1370,7 +1502,7 @@ def evaluate_candidate(
 
         action = "TRADE"
 
-    elif watch_score >= 0.60:
+    elif pass_rate >= 0.60:
 
         action = "WATCH"
 
@@ -1447,16 +1579,16 @@ def evaluate_candidate(
             action,
 
         "failed":
-            failed,
+            ",".join(failed),
 
-        "watch_score":
-            watch_score,
+        "pass_rate":
+            pass_rate,
 
     }
 
 
 # ============================================================
-# IPO INFORMATION
+# IPO DATA
 # ============================================================
 
 def get_ipo_information():
@@ -1468,11 +1600,13 @@ def get_ipo_information():
     headers = {
 
         "User-Agent":
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/120 Safari/537.36",
+            (
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/120 Safari/537.36"
+            ),
 
         "Accept":
             "application/json,text/plain,*/*",
@@ -1499,6 +1633,12 @@ def get_ipo_information():
         )
 
         if response.status_code != 200:
+
+            print(
+                "IPO HTTP status:",
+                response.status_code
+            )
+
             return []
 
         data = response.json()
@@ -1542,35 +1682,65 @@ def get_ipo_information():
 
         return results[:10]
 
-    except Exception:
+    except Exception as exc:
+
+        print(
+            f"IPO retrieval error: {exc}"
+        )
 
         return []
 
 
 # ============================================================
-# TELEGRAM SEND
+# TELEGRAM
 # ============================================================
 
-def telegram_send(
-    message
-):
+def telegram_send(message):
 
-    bot_token = os.getenv(
-        "TELEGRAM_BOT_TOKEN"
+    bot_token = (
+        os.getenv(
+            "TELEGRAM_BOT_TOKEN"
+        )
+        or
+        os.getenv(
+            "BOT_TOKEN"
+        )
     )
 
-    chat_id = os.getenv(
-        "TELEGRAM_CHAT_ID"
+    chat_id = (
+        os.getenv(
+            "TELEGRAM_CHAT_ID"
+        )
+        or
+        os.getenv(
+            "CHAT_ID"
+        )
     )
+
+    if not bot_token or not chat_id:
+
+        print(
+            "Telegram credentials not configured."
+        )
+
+        return False
+
+    bot_token = str(
+        bot_token
+    ).strip()
+
+    chat_id = str(
+        chat_id
+    ).strip()
 
     if (
         not bot_token
-        or not chat_id
+        or
+        not chat_id
     ):
 
         print(
-            "Telegram credentials "
-            "not configured."
+            "Telegram credentials are empty."
         )
 
         return False
@@ -1601,14 +1771,18 @@ def telegram_send(
         if response.status_code != 200:
 
             print(
-                "Telegram HTTP error:",
+                "Telegram error:",
                 response.status_code,
                 response.text
             )
 
-        return (
-            response.status_code == 200
+            return False
+
+        print(
+            "Telegram alert sent successfully."
         )
+
+        return True
 
     except Exception as exc:
 
@@ -1617,26 +1791,6 @@ def telegram_send(
         )
 
         return False
-
-
-# ============================================================
-# MONEY FORMAT
-# ============================================================
-
-def format_money(
-    value
-):
-
-    value = safe_float(
-        value
-    )
-
-    if not np.isfinite(value):
-        return "N/A"
-
-    return (
-        f"₹{value:,.2f}"
-    )
 
 
 # ============================================================
@@ -1680,8 +1834,8 @@ def build_alert(
 
         (
             f"NIFTY: "
-            f"{format_money(market['nifty'])} "
-            f"| SMA50: "
+            f"{format_money(market['nifty'])}"
+            f" | SMA50: "
             f"{format_money(market['sma50'])}"
         ),
 
@@ -1697,16 +1851,20 @@ def build_alert(
     ]
 
     trades = [
-        x
-        for x in candidates
-        if x["action"] == "TRADE"
+        item
+        for item in candidates
+        if item["action"] == "TRADE"
     ]
 
     watches = [
-        x
-        for x in candidates
-        if x["action"] == "WATCH"
+        item
+        for item in candidates
+        if item["action"] == "WATCH"
     ]
+
+    # ========================================================
+    # WEEKEND PROTECTION
+    # ========================================================
 
     if not trading_day:
 
@@ -1723,9 +1881,13 @@ def build_alert(
 
         ]
 
+    # ========================================================
+    # TRADE SETUPS
+    # ========================================================
+
     if trades:
 
-        for i, x in enumerate(
+        for index, item in enumerate(
             trades[:MAX_TOP_PICKS],
             start=1
         ):
@@ -1735,95 +1897,83 @@ def build_alert(
                 "",
 
                 (
-                    f"{i}. "
-                    f"{x['symbol']} "
-                    f"— TRADE"
+                    f"{index}. "
+                    f"{item['symbol']} — TRADE"
                 ),
 
                 (
                     f"Price: "
-                    f"{format_money(x['price'])}"
+                    f"{format_money(item['price'])}"
                 ),
-
-                # =================================================
-                # IMPORTANT CORRECTION:
-                #
-                # The model calculates 3D and 5D probabilities.
-                # It does NOT calculate a true 1D probability.
-                #
-                # Therefore DO NOT display:
-                # P(UP) 1D / 3D / 5D
-                #
-                # =================================================
 
                 (
                     "Calibrated P(UP) "
-                    f"3D / 5D: "
-                    f"{x['p3']:.1%} / "
-                    f"{x['p5']:.1%}"
+                    "3D / 5D: "
+                    f"{item['p3']:.1%} / "
+                    f"{item['p5']:.1%}"
                 ),
 
                 (
                     "Raw analogue P(UP) "
-                    f"3D / 5D: "
-                    f"{x['raw_p3']:.1%} / "
-                    f"{x['raw_p5']:.1%}"
+                    "3D / 5D: "
+                    f"{item['raw_p3']:.1%} / "
+                    f"{item['raw_p5']:.1%}"
                 ),
 
                 (
                     "Expected return "
-                    f"3D / 5D: "
-                    f"{x['er3']:.2%} / "
-                    f"{x['er5']:.2%}"
+                    "3D / 5D: "
+                    f"{item['er3']:.2%} / "
+                    f"{item['er5']:.2%}"
                 ),
 
                 (
                     f"Score: "
-                    f"{x['score']:.3f} "
-                    f"| RSI: "
-                    f"{x['rsi']:.1f} "
-                    f"| Volume: "
-                    f"{x['volume_ratio']:.2f}x"
+                    f"{item['score']:.3f}"
+                    f" | RSI: "
+                    f"{item['rsi']:.1f}"
+                    f" | Volume: "
+                    f"{item['volume_ratio']:.2f}x"
                 ),
 
                 (
                     f"Entry: "
-                    f"{format_money(x['price'])}"
+                    f"{format_money(item['price'])}"
                 ),
 
                 (
                     f"Stop Loss: "
-                    f"{format_money(x['stop'])}"
+                    f"{format_money(item['stop'])}"
                 ),
 
                 (
                     f"Target 1: "
-                    f"{format_money(x['target1'])}"
+                    f"{format_money(item['target1'])}"
                 ),
 
                 (
                     f"Target 2: "
-                    f"{format_money(x['target2'])}"
+                    f"{format_money(item['target2'])}"
                 ),
 
                 (
                     f"Risk/Reward: "
-                    f"{x['rr1']:.2f} / "
-                    f"{x['rr2']:.2f}"
+                    f"{item['rr1']:.2f} / "
+                    f"{item['rr2']:.2f}"
                 ),
 
                 "Expected holding: 1–5 sessions",
 
                 (
                     f"Suggested position: "
-                    f"{x['shares']} shares "
+                    f"{item['shares']} shares "
                     f"≈ "
-                    f"{format_money(x['exposure'])}"
+                    f"{format_money(item['exposure'])}"
                 ),
 
                 (
                     f"Maximum planned loss: "
-                    f"{format_money(x['planned_loss'])}"
+                    f"{format_money(item['planned_loss'])}"
                 ),
 
             ]
@@ -1844,6 +1994,10 @@ def build_alert(
 
         ]
 
+    # ========================================================
+    # WATCHLIST
+    # ========================================================
+
     lines += [
 
         "",
@@ -1854,15 +2008,15 @@ def build_alert(
 
     if watches:
 
-        sorted_watches = sorted(
+        watches = sorted(
             watches,
-            key=lambda z:
-                z["score"],
+            key=lambda x:
+                x["score"],
             reverse=True
         )
 
-        for i, x in enumerate(
-            sorted_watches[:3],
+        for index, item in enumerate(
+            watches[:3],
             start=1
         ):
 
@@ -1871,47 +2025,46 @@ def build_alert(
                 "",
 
                 (
-                    f"{i}. "
-                    f"{x['symbol']} "
-                    f"— WATCH"
+                    f"{index}. "
+                    f"{item['symbol']} — WATCH"
                 ),
 
                 (
                     f"Price: "
-                    f"{format_money(x['price'])}"
+                    f"{format_money(item['price'])}"
                 ),
 
                 (
                     "Calibrated P(UP) "
-                    f"3D / 5D: "
-                    f"{x['p3']:.1%} / "
-                    f"{x['p5']:.1%}"
+                    "3D / 5D: "
+                    f"{item['p3']:.1%} / "
+                    f"{item['p5']:.1%}"
                 ),
 
                 (
                     "Expected return "
-                    f"3D / 5D: "
-                    f"{x['er3']:.2%} / "
-                    f"{x['er5']:.2%}"
+                    "3D / 5D: "
+                    f"{item['er3']:.2%} / "
+                    f"{item['er5']:.2%}"
                 ),
 
                 (
                     f"RR1: "
-                    f"{x['rr1']:.2f} "
-                    f"| RR2: "
-                    f"{x['rr2']:.2f}"
+                    f"{item['rr1']:.2f}"
+                    f" | RR2: "
+                    f"{item['rr2']:.2f}"
                 ),
 
                 (
                     f"RSI: "
-                    f"{x['rsi']:.1f} "
-                    f"| Volume: "
-                    f"{x['volume_ratio']:.2f}x"
+                    f"{item['rsi']:.1f}"
+                    f" | Volume: "
+                    f"{item['volume_ratio']:.2f}x"
                 ),
 
                 (
                     f"Score: "
-                    f"{x['score']:.3f}"
+                    f"{item['score']:.3f}"
                 ),
 
                 "Action: WATCH / WAIT",
@@ -1924,6 +2077,10 @@ def build_alert(
             "None."
         )
 
+    # ========================================================
+    # IPO
+    # ========================================================
+
     lines += [
 
         "",
@@ -1935,9 +2092,11 @@ def build_alert(
     if ipo_names:
 
         lines.append(
-            "IPO records retrieved. "
-            "Verify issue dates, price band "
-            "and subscription status before applying."
+            (
+                "IPO records retrieved. "
+                "Verify issue dates, price band "
+                "and subscription status before applying."
+            )
         )
 
         for name in ipo_names:
@@ -1961,6 +2120,10 @@ def build_alert(
             ),
 
         ]
+
+    # ========================================================
+    # DISCLAIMER
+    # ========================================================
 
     lines += [
 
@@ -1986,13 +2149,11 @@ def build_alert(
 
     ]
 
-    return "\n".join(
-        lines
-    )
+    return "\n".join(lines)
 
 
 # ============================================================
-# MAIN
+# MAIN ENGINE
 # ============================================================
 
 def main():
@@ -2005,6 +2166,16 @@ def main():
 
     print("=" * 70)
 
+    print(
+        f"Configured capital: "
+        f"{format_money(CAPITAL)}"
+    )
+
+    print(
+        f"Maximum risk/trade: "
+        f"{MAX_RISK_PCT:.2%}"
+    )
+
     signal_date = clean_date(
         datetime.now()
     )
@@ -2012,8 +2183,8 @@ def main():
     trading_day = is_trading_day()
 
     tickers = [
-        ticker(s)
-        for s in SYMBOLS
+        ticker(symbol)
+        for symbol in SYMBOLS
     ]
 
     tickers += [
@@ -2022,27 +2193,35 @@ def main():
     ]
 
     print(
-        f"Downloading "
-        f"{len(tickers)} tickers..."
+        f"Downloading data for "
+        f"{len(tickers)} instruments..."
     )
 
-    raw = yf.download(
+    try:
 
-        tickers=tickers,
+        raw = yf.download(
 
-        period="3y",
+            tickers=tickers,
 
-        interval="1d",
+            period="3y",
 
-        auto_adjust=True,
+            interval="1d",
 
-        group_by="column",
+            auto_adjust=True,
 
-        progress=False,
+            group_by="column",
 
-        threads=True,
+            progress=False,
 
-    )
+            threads=True,
+
+        )
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            f"Market data download failed: {exc}"
+        )
 
     frames = split_download(
         raw
@@ -2059,6 +2238,10 @@ def main():
         f"{len(frames)}"
     )
 
+    # ========================================================
+    # MARKET REGIME
+    # ========================================================
+
     market = market_regime(
         frames,
         signal_date
@@ -2069,6 +2252,10 @@ def main():
         f"{market['regime']}"
     )
 
+    # ========================================================
+    # FEATURE CALCULATION
+    # ========================================================
+
     feature_frames = {}
 
     for symbol in SYMBOLS:
@@ -2078,15 +2265,14 @@ def main():
         )
 
         if df is None or df.empty:
+
             continue
 
         try:
 
             feature_frames[
                 symbol
-            ] = add_features(
-                df
-            )
+            ] = add_features(df)
 
         except Exception as exc:
 
@@ -2094,6 +2280,15 @@ def main():
                 f"Feature error "
                 f"{symbol}: {exc}"
             )
+
+    print(
+        f"Stocks with features: "
+        f"{len(feature_frames)}"
+    )
+
+    # ========================================================
+    # MODEL EVALUATION
+    # ========================================================
 
     candidates = []
 
@@ -2106,6 +2301,7 @@ def main():
         ].copy()
 
         if len(hist) < 300:
+
             continue
 
         valid = hist.dropna(
@@ -2119,6 +2315,7 @@ def main():
         )
 
         if valid.empty:
+
             continue
 
         latest = valid.iloc[-1]
@@ -2129,6 +2326,7 @@ def main():
         )
 
         if model is None:
+
             continue
 
         row = {
@@ -2168,6 +2366,10 @@ def main():
                 candidate
             )
 
+    # ========================================================
+    # SORT
+    # ========================================================
+
     candidates = sorted(
 
         candidates,
@@ -2184,6 +2386,11 @@ def main():
 
         reverse=True
 
+    )
+
+    print(
+        f"Candidates evaluated: "
+        f"{len(candidates)}"
     )
 
     # ========================================================
@@ -2211,6 +2418,11 @@ def main():
             index=False
         )
 
+        print(
+            f"Audit saved: "
+            f"{audit_file}"
+        )
+
     # ========================================================
     # IPO
     # ========================================================
@@ -2220,7 +2432,7 @@ def main():
     )
 
     # ========================================================
-    # BUILD ALERT
+    # ALERT
     # ========================================================
 
     message = build_alert(
@@ -2235,10 +2447,6 @@ def main():
 
     )
 
-    # ========================================================
-    # CONSOLE OUTPUT
-    # ========================================================
-
     print("")
     print(message)
     print("")
@@ -2251,6 +2459,10 @@ def main():
         message
     )
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
 
