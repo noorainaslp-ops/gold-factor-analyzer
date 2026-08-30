@@ -1,0 +1,67 @@
+name: V6.3.15 Chronological Walk-Forward Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    name: V6.3.15 Chronological Walk-Forward Backtest
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Verify required files
+        run: |
+          set -e
+
+          echo "Checking repository files..."
+
+          test -f backtest_v6_3_15.py
+          test -f requirements.txt
+
+          echo "Required files found."
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate V6.3.15 syntax
+        run: |
+          python -m py_compile backtest_v6_3_15.py
+
+      - name: Run V6.3.15 chronological walk-forward backtest
+        env:
+          ALERT_CAPITAL: "100000"
+          COST_BPS: "15"
+          SLIPPAGE_BPS: "5"
+          BACKTEST_START: "2021-01-01"
+        run: |
+          python backtest_v6_3_15.py
+
+      - name: List audit files
+        if: always()
+        run: |
+          echo "Audit files:"
+          find audit -maxdepth 1 -type f -print 2>/dev/null || true
+
+      - name: Upload V6.3.15 audit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v6-3-15-backtest-results
+          path: audit/
+          if-no-files-found: warn
+          retention-days: 30
