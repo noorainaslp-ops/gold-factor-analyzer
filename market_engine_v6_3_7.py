@@ -1,33 +1,34 @@
 """
 ============================================================
-MULTI-FACTOR MARKET ALERT V6.3.6
+MULTI-FACTOR MARKET ALERT V6.3.7
 ============================================================
 
+Purpose:
 Short-term Indian equity research screener.
 
-V6.3.6 improvements:
-- Safe environment-variable handling
-- No crash on empty GitHub variables
-- Safe trend handling
-- Conservative empirical analogue model
-- 3-session and 5-session P(UP)
-- Expected return estimation
-- Risk/reward calculation
+V6.3.7 changes:
+- Correct UNKNOWN vs UNFAVORABLE market regime
+- Robust Nifty/SMA50 data handling
+- Weekend/non-trading-day protection
+- Robust GitHub environment-variable handling
+- Empirical analogue probabilities
+- Expected-return estimates
+- Risk/reward calculations
 - Position sizing
-- Market regime filter
-- Weekend protection
+- TRADE / WATCH / REJECT classification
+- Diagnostic failed-filter reporting
+- Safe Telegram delivery
 - IPO retrieval
-- Telegram alerts
 - CSV audit trail
-- No negative stop-loss values
-- No artificial BUY signal when market regime is poor
+- No negative stop losses
+- No zero/invalid RR displayed as a valid trade
 
 IMPORTANT:
-This is a probabilistic research model.
+This is a probabilistic research system.
 It does not guarantee profit.
 
-P(UP) is an empirical/calibrated estimate,
-not a guaranteed probability of profit.
+P(UP) is an empirical estimate and is NOT
+a guaranteed probability of profit.
 ============================================================
 """
 
@@ -48,24 +49,21 @@ import yfinance as yf
 # VERSION
 # ============================================================
 
-VERSION = "V6.3.6"
+VERSION = "V6.3.7"
 
 
 # ============================================================
-# SAFE ENVIRONMENT VARIABLES
+# SAFE ENVIRONMENT VARIABLE
 # ============================================================
 
 def safe_env_float(name, default):
     """
-    Safely read a numeric environment variable.
+    Safely read numeric GitHub environment variables.
 
-    GitHub Actions may provide an environment variable as
-    an empty string. float("") causes ValueError.
-
-    This function safely handles:
-    - missing variable
-    - empty variable
-    - invalid text
+    Handles:
+    - missing variables
+    - empty strings
+    - invalid strings
     - NaN
     - infinity
     """
@@ -81,10 +79,9 @@ def safe_env_float(name, default):
         return float(default)
 
     try:
-
         value = float(raw)
 
-        if not math.isfinite(value):
+        if not np.isfinite(value):
             return float(default)
 
         return value
@@ -100,7 +97,7 @@ def safe_env_float(name, default):
 
 
 # ============================================================
-# CAPITAL / RISK CONFIGURATION
+# CAPITAL / RISK
 # ============================================================
 
 CAPITAL = safe_env_float(
@@ -114,67 +111,50 @@ MAX_RISK_PCT = safe_env_float(
 )
 
 
-# ============================================================
-# SAFETY VALIDATION
-# ============================================================
-
 if CAPITAL <= 0:
-
-    print(
-        "WARNING: TRADING_CAPITAL must be positive. "
-        "Using ₹1,00,000."
-    )
 
     CAPITAL = 100000
 
 
 if MAX_RISK_PCT <= 0:
 
-    print(
-        "WARNING: MAX_RISK_PCT must be positive. "
-        "Using 1%."
-    )
-
     MAX_RISK_PCT = 0.01
 
 
 if MAX_RISK_PCT > 0.05:
 
-    print(
-        "WARNING: MAX_RISK_PCT above 5%. "
-        "Capping at 5%."
-    )
-
     MAX_RISK_PCT = 0.05
 
 
 # ============================================================
-# MODEL CONFIGURATION
+# MODEL SETTINGS
 # ============================================================
+
+LOOKBACK_DAYS = 756
 
 N_ANALOGUES = 30
 
 MIN_ANALOGUES = 15
 
-LOOKBACK_DAYS = 756
+MIN_P3 = 0.52
 
-# Probability requirements
-MIN_CALIBRATED_P3 = 0.52
-MIN_CALIBRATED_P5 = 0.51
+MIN_P5 = 0.51
 
-# Expected return requirements
-MIN_NET_ER3 = 0.0010
-MIN_NET_ER5 = 0.0015
+MIN_ER3 = 0.0010
 
-# Risk/reward requirements
+MIN_ER5 = 0.0015
+
 MIN_RR1 = 1.00
+
 MIN_RR2 = 1.20
 
-# Technical safety filters
-MAX_RSI = 75.0
+MIN_QUALITY = 0.25
+
 MIN_VOLUME_RATIO = 0.80
 
-MAX_TOP_PICKS = 5
+MAX_RSI = 75.0
+
+MAX_WATCH_RESULTS = 5
 
 AUDIT_DIR = Path("audit")
 
@@ -185,7 +165,7 @@ AUDIT_DIR.mkdir(
 
 
 # ============================================================
-# STOCK UNIVERSE
+# UNIVERSE
 # ============================================================
 
 SYMBOLS = [
@@ -254,7 +234,7 @@ SYMBOLS = [
 
 
 # ============================================================
-# BASIC HELPERS
+# HELPERS
 # ============================================================
 
 def ticker(symbol):
@@ -269,28 +249,14 @@ def safe_float(value, default=np.nan):
         value = float(value)
 
         if np.isfinite(value):
+
             return value
 
     except Exception:
+
         pass
 
     return default
-
-
-def clean_date(value):
-
-    ts = pd.Timestamp(value)
-
-    if ts.tzinfo is not None:
-
-        ts = ts.tz_localize(None)
-
-    return ts.normalize()
-
-
-def is_trading_day():
-
-    return datetime.now().weekday() < 5
 
 
 def format_money(value):
@@ -302,6 +268,11 @@ def format_money(value):
         return "N/A"
 
     return f"₹{value:,.2f}"
+
+
+def is_trading_day():
+
+    return datetime.now().weekday() < 5
 
 
 # ============================================================
@@ -329,19 +300,24 @@ def clean_frame(df):
 
         return None
 
-    for column in required:
+    for col in required:
 
-        if column not in df.columns:
+        if col not in df.columns:
 
-            df[column] = np.nan
+            df[col] = np.nan
 
     df = df[
         required
     ].copy()
 
     df.index = pd.to_datetime(
-        df.index
+        df.index,
+        errors="coerce"
     )
+
+    df = df[
+        ~df.index.isna()
+    ]
 
     df = df[
         ~df.index.duplicated(
@@ -386,7 +362,6 @@ def split_download(raw):
     )
 
     # --------------------------------------------------------
-    # Structure:
     # Price -> ticker
     # --------------------------------------------------------
 
@@ -416,7 +391,6 @@ def split_download(raw):
                 continue
 
     # --------------------------------------------------------
-    # Structure:
     # ticker -> Price
     # --------------------------------------------------------
 
@@ -480,18 +454,22 @@ def calculate_rsi(
     ).mean()
 
     rs = (
+
         avg_gain
         /
         avg_loss.replace(
             0,
             np.nan
         )
+
     )
 
     rsi = (
+
         100
         -
         100 / (1 + rs)
+
     )
 
     rsi = rsi.where(
@@ -503,7 +481,7 @@ def calculate_rsi(
 
 
 # ============================================================
-# FEATURE ENGINEERING
+# FEATURES
 # ============================================================
 
 def add_features(df):
@@ -575,6 +553,7 @@ def add_features(df):
 
     true_range = pd.concat(
         [
+
             high - low,
 
             (
@@ -588,9 +567,12 @@ def add_features(df):
                 -
                 previous_close
             ).abs(),
+
         ],
         axis=1
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
     x["atr14"] = (
         true_range
@@ -626,35 +608,40 @@ def add_features(df):
         close
         /
         x["sma20"]
-        - 1
+        -
+        1
     )
 
     x["dist_sma50"] = (
         close
         /
         x["sma50"]
-        - 1
+        -
+        1
     )
 
     x["dist_sma200"] = (
         close
         /
         x["sma200"]
-        - 1
+        -
+        1
     )
 
     x["sma50_slope5"] = (
         x["sma50"]
         /
         x["sma50"].shift(5)
-        - 1
+        -
+        1
     )
 
     x["ema10_slope5"] = (
         x["ema10"]
         /
         x["ema10"].shift(5)
-        - 1
+        -
+        1
     )
 
     return x
@@ -693,6 +680,10 @@ def market_regime(
         "^INDIAVIX"
     )
 
+    # --------------------------------------------------------
+    # No Nifty data
+    # --------------------------------------------------------
+
     if nifty is None or nifty.empty:
 
         return {
@@ -709,13 +700,44 @@ def market_regime(
             "vix":
                 np.nan,
 
+            "reason":
+                "Nifty data unavailable",
+
         }
 
-    n = nifty.loc[
-        nifty.index <= signal_date
+    n = nifty.copy()
+
+    n.index = pd.to_datetime(
+        n.index,
+        errors="coerce"
+    )
+
+    n = n[
+        ~n.index.isna()
     ]
 
-    if len(n) < 60:
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Use the latest AVAILABLE trading session rather than
+    # requiring today's date to exist in the data.
+    #
+    # This fixes weekend / holiday SMA50=N/A problems.
+    # --------------------------------------------------------
+
+    n = n[
+        n.index <= pd.Timestamp(
+            signal_date
+        )
+    ]
+
+    n = n.dropna(
+        subset=[
+            "Close"
+        ]
+    )
+
+    if len(n) < 55:
 
         return {
 
@@ -723,13 +745,20 @@ def market_regime(
                 "UNKNOWN",
 
             "nifty":
-                np.nan,
+                safe_float(
+                    n["Close"].iloc[-1]
+                )
+                if not n.empty
+                else np.nan,
 
             "sma50":
                 np.nan,
 
             "vix":
                 np.nan,
+
+            "reason":
+                "Insufficient Nifty history",
 
         }
 
@@ -741,77 +770,163 @@ def market_regime(
         .mean()
     )
 
-    current = safe_float(
-        close.iloc[-1]
+    # --------------------------------------------------------
+    # Find latest valid SMA50
+    # --------------------------------------------------------
+
+    valid = pd.DataFrame({
+
+        "close":
+            close,
+
+        "sma50":
+            sma50,
+
+    }).dropna()
+
+    if len(valid) < 6:
+
+        return {
+
+            "regime":
+                "UNKNOWN",
+
+            "nifty":
+                safe_float(
+                    close.iloc[-1]
+                ),
+
+            "sma50":
+                np.nan,
+
+            "vix":
+                np.nan,
+
+            "reason":
+                "SMA50 could not be calculated",
+
+        }
+
+    latest = valid.iloc[-1]
+
+    previous = valid.iloc[-6]
+
+    nifty_value = safe_float(
+        latest["close"]
     )
 
-    current_sma50 = safe_float(
-        sma50.iloc[-1]
+    sma50_value = safe_float(
+        latest["sma50"]
     )
 
     previous_sma50 = safe_float(
-        sma50.iloc[-6]
+        previous["sma50"]
     )
 
-    above = (
+    # --------------------------------------------------------
+    # FINAL SAFETY CHECK
+    # --------------------------------------------------------
 
-        np.isfinite(current)
+    if (
 
-        and
-
-        np.isfinite(
-            current_sma50
+        not np.isfinite(
+            nifty_value
         )
 
-        and
+        or
 
-        current >= current_sma50
-
-    )
-
-    rising = (
-
-        np.isfinite(
-            current_sma50
+        not np.isfinite(
+            sma50_value
         )
 
-        and
+        or
 
-        np.isfinite(
+        not np.isfinite(
             previous_sma50
         )
 
-        and
-
-        current_sma50
-        >
-        previous_sma50
-
-    )
-
-    if above and rising:
-
-        regime = "FAVORABLE"
-
-    elif (
-        not above
-        and
-        not rising
     ):
 
-        regime = "UNFAVORABLE"
+        regime = "UNKNOWN"
+
+        reason = (
+            "Invalid Nifty/SMA50 values"
+        )
 
     else:
 
-        regime = "MIXED"
+        above = (
+            nifty_value
+            >=
+            sma50_value
+        )
+
+        rising = (
+            sma50_value
+            >
+            previous_sma50
+        )
+
+        if above and rising:
+
+            regime = "FAVORABLE"
+
+            reason = (
+                "Nifty above rising SMA50"
+            )
+
+        elif (
+            not above
+            and
+            not rising
+        ):
+
+            regime = "UNFAVORABLE"
+
+            reason = (
+                "Nifty below falling SMA50"
+            )
+
+        else:
+
+            regime = "MIXED"
+
+            reason = (
+                "Price/SMA50 trend signals mixed"
+            )
+
+    # --------------------------------------------------------
+    # VIX
+    # --------------------------------------------------------
 
     vix_value = np.nan
 
-    if vix is not None:
+    if vix is not None and not vix.empty:
 
-        vv = vix.loc[
-            vix.index <= signal_date
+        vv = vix.copy()
+
+        vv.index = pd.to_datetime(
+            vv.index,
+            errors="coerce"
+        )
+
+        vv = vv[
+            ~vv.index.isna()
         ]
+
+        vv = vv[
+            vv.index
+            <=
+            pd.Timestamp(
+                signal_date
+            )
+        ]
+
+        vv = vv.dropna(
+            subset=[
+                "Close"
+            ]
+        )
 
         if not vv.empty:
 
@@ -825,13 +940,16 @@ def market_regime(
             regime,
 
         "nifty":
-            current,
+            nifty_value,
 
         "sma50":
-            current_sma50,
+            sma50_value,
 
         "vix":
             vix_value,
+
+        "reason":
+            reason,
 
     }
 
@@ -846,7 +964,11 @@ def analogue_model(
 ):
 
     data = features.loc[
-        features.index <= signal_date
+        features.index
+        <=
+        pd.Timestamp(
+            signal_date
+        )
     ].copy()
 
     required = (
@@ -865,11 +987,7 @@ def analogue_model(
 
     candidate = data.iloc[-1]
 
-    # --------------------------------------------------------
-    # Avoid using the immediately preceding overlapping
-    # observations as training analogues.
-    # --------------------------------------------------------
-
+    # Avoid the most recent overlapping observations.
     train = data.iloc[
         :-6
     ].copy()
@@ -883,30 +1001,26 @@ def analogue_model(
     ).copy()
 
     # --------------------------------------------------------
-    # Future returns
+    # Forward returns
     # --------------------------------------------------------
 
     train["future3"] = (
 
         train["Close"].shift(-3)
-
         /
-
         train["Close"]
-
-        - 1
+        -
+        1
 
     )
 
     train["future5"] = (
 
         train["Close"].shift(-5)
-
         /
-
         train["Close"]
-
-        - 1
+        -
+        1
 
     )
 
@@ -922,7 +1036,7 @@ def analogue_model(
         return None
 
     # --------------------------------------------------------
-    # Distance calculation
+    # Distance
     # --------------------------------------------------------
 
     distances = np.zeros(
@@ -975,7 +1089,6 @@ def analogue_model(
         distances += (
 
             (
-
                 (
                     series.values
                     -
@@ -983,7 +1096,6 @@ def analogue_model(
                 )
                 /
                 scale
-
             )
             ** 2
 
@@ -998,10 +1110,6 @@ def analogue_model(
     )
 
     train["distance"] = distances
-
-    # --------------------------------------------------------
-    # Nearest historical analogues
-    # --------------------------------------------------------
 
     train = (
 
@@ -1020,12 +1128,12 @@ def analogue_model(
         return None
 
     # --------------------------------------------------------
-    # Distance weights
+    # Weights
     # --------------------------------------------------------
 
     weights = (
 
-        1
+        1.0
         /
         (
             train["distance"]
@@ -1044,13 +1152,12 @@ def analogue_model(
     )
 
     # --------------------------------------------------------
-    # Raw empirical probabilities
+    # Raw probabilities
     # --------------------------------------------------------
 
     raw_p3 = float(
 
         (
-
             weights
             *
             (
@@ -1058,7 +1165,6 @@ def analogue_model(
                 >
                 0
             )
-
         ).sum()
 
     )
@@ -1066,7 +1172,6 @@ def analogue_model(
     raw_p5 = float(
 
         (
-
             weights
             *
             (
@@ -1074,7 +1179,6 @@ def analogue_model(
                 >
                 0
             )
-
         ).sum()
 
     )
@@ -1086,11 +1190,9 @@ def analogue_model(
     er3 = float(
 
         (
-
             weights
             *
             train["future3"]
-
         ).sum()
 
     )
@@ -1098,37 +1200,25 @@ def analogue_model(
     er5 = float(
 
         (
-
             weights
             *
             train["future5"]
-
         ).sum()
 
     )
 
-    # --------------------------------------------------------
-    # Dispersion
-    # --------------------------------------------------------
-
     std3 = safe_float(
-
         train["future3"].std(),
-
         0.05
-
     )
 
     std5 = safe_float(
-
         train["future5"].std(),
-
         0.07
-
     )
 
     # --------------------------------------------------------
-    # Conservative probability shrinkage
+    # Shrink empirical probabilities toward 50%.
     # --------------------------------------------------------
 
     shrinkage = min(
@@ -1144,13 +1234,9 @@ def analogue_model(
 
     )
 
-    calibrated_p3 = (
+    p3 = (
 
-        (
-            1
-            -
-            shrinkage
-        )
+        (1 - shrinkage)
         *
         raw_p3
 
@@ -1162,13 +1248,9 @@ def analogue_model(
 
     )
 
-    calibrated_p5 = (
+    p5 = (
 
-        (
-            1
-            -
-            shrinkage
-        )
+        (1 - shrinkage)
         *
         raw_p5
 
@@ -1181,24 +1263,8 @@ def analogue_model(
     )
 
     # --------------------------------------------------------
-    # Model quality
+    # Quality
     # --------------------------------------------------------
-
-    dispersion_penalty3 = min(
-
-        1.0,
-
-        std3 / 0.035
-
-    )
-
-    dispersion_penalty5 = min(
-
-        1.0,
-
-        std5 / 0.055
-
-    )
 
     sample_quality = min(
 
@@ -1207,6 +1273,26 @@ def analogue_model(
         len(train)
         /
         N_ANALOGUES
+
+    )
+
+    dispersion3 = min(
+
+        1.0,
+
+        std3
+        /
+        0.035
+
+    )
+
+    dispersion5 = min(
+
+        1.0,
+
+        std5
+        /
+        0.055
 
     )
 
@@ -1223,7 +1309,7 @@ def analogue_model(
         (
             1
             -
-            dispersion_penalty3
+            dispersion3
         )
 
         +
@@ -1233,7 +1319,7 @@ def analogue_model(
         (
             1
             -
-            dispersion_penalty5
+            dispersion5
         )
 
     )
@@ -1255,10 +1341,10 @@ def analogue_model(
             raw_p5,
 
         "p3":
-            calibrated_p3,
+            p3,
 
         "p5":
-            calibrated_p5,
+            p5,
 
         "er3":
             er3,
@@ -1289,7 +1375,7 @@ def analogue_model(
 
 
 # ============================================================
-# STOP / TARGET / RISK REWARD
+# TRADE LEVELS
 # ============================================================
 
 def calculate_trade_levels(
@@ -1308,27 +1394,23 @@ def calculate_trade_levels(
     )
 
     er3 = safe_float(
-        er3
+        er3,
+        0.0
     )
 
     er5 = safe_float(
-        er5
+        er5,
+        0.0
     )
 
     if (
 
         not np.isfinite(price)
-
         or
-
         price <= 0
-
         or
-
         not np.isfinite(atr_pct)
-
         or
-
         atr_pct <= 0
 
     ):
@@ -1367,7 +1449,7 @@ def calculate_trade_levels(
 
     )
 
-    # NEVER allow zero or negative stop.
+    # Never permit an invalid stop.
     stop = max(
         0.01,
         stop
@@ -1386,9 +1468,9 @@ def calculate_trade_levels(
         return None
 
     # --------------------------------------------------------
-    # Expected-return-based targets
+    # Targets
     #
-    # These are projections, not guarantees.
+    # Expected returns are used as research projections.
     # --------------------------------------------------------
 
     target1_return = max(
@@ -1396,11 +1478,8 @@ def calculate_trade_levels(
         0.0,
 
         min(
-
             0.08,
-
             er3
-
         )
 
     )
@@ -1410,11 +1489,8 @@ def calculate_trade_levels(
         target1_return,
 
         min(
-
             0.12,
-
             er5
-
         )
 
     )
@@ -1448,16 +1524,18 @@ def calculate_trade_levels(
         target1
         -
         price
-
-    ) / risk_per_share
+    )
+    /
+    risk_per_share
 
     rr2 = (
 
         target2
         -
         price
-
-    ) / risk_per_share
+    )
+    /
+    risk_per_share
 
     if not np.isfinite(rr1):
 
@@ -1510,13 +1588,9 @@ def position_size(
     if (
 
         not np.isfinite(price)
-
         or
-
         not np.isfinite(stop)
-
         or
-
         price <= stop
 
     ):
@@ -1574,7 +1648,6 @@ def position_size(
         min(
 
             shares_by_risk,
-
             shares_by_capital
 
         )
@@ -1582,27 +1655,21 @@ def position_size(
     )
 
     exposure = (
-
         shares
         *
         price
-
     )
 
     planned_loss = (
-
         shares
         *
         risk_per_share
-
     )
 
     return (
 
         shares,
-
         exposure,
-
         planned_loss
 
     )
@@ -1617,99 +1684,40 @@ def calculate_score(
     regime
 ):
 
-    """
-    Calculate the V6.3.6 ranking score.
-
-    IMPORTANT:
-    Older versions sometimes expected row["trend"],
-    while the engine actually stores the value as
-    dist_sma50.
-
-    This function accepts either name so that a missing
-    'trend' field cannot crash the engine.
-    """
-
-    # --------------------------------------------------------
-    # Probability
-    # --------------------------------------------------------
-
     p3 = safe_float(
-
-        row.get(
-            "p3"
-        ),
-
+        row.get("p3"),
         0.50
-
     )
 
     p5 = safe_float(
-
-        row.get(
-            "p5"
-        ),
-
+        row.get("p5"),
         0.50
-
     )
 
-    # --------------------------------------------------------
-    # Expected return
-    # --------------------------------------------------------
-
     er3 = safe_float(
-
-        row.get(
-            "er3"
-        ),
-
+        row.get("er3"),
         0.0
-
     )
 
     er5 = safe_float(
-
-        row.get(
-            "er5"
-        ),
-
+        row.get("er5"),
         0.0
-
     )
 
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
-    rsi_value = safe_float(
-
-        row.get(
-            "rsi"
-        ),
-
+    rsi = safe_float(
+        row.get("rsi"),
         50.0
-
     )
-
-    # --------------------------------------------------------
-    # Volume
-    # --------------------------------------------------------
 
     volume = safe_float(
-
         row.get(
             "volume_ratio"
         ),
-
         1.0
-
     )
 
     # --------------------------------------------------------
-    # TREND FIX
-    #
-    # Prefer 'trend'.
-    # Fall back to 'dist_sma50'.
+    # V6.3.7 trend compatibility fix
     # --------------------------------------------------------
 
     trend = safe_float(
@@ -1719,11 +1727,8 @@ def calculate_score(
             "trend",
 
             row.get(
-
                 "dist_sma50",
-
                 0.0
-
             )
 
         ),
@@ -1732,47 +1737,27 @@ def calculate_score(
 
     )
 
-    # --------------------------------------------------------
-    # Base score
-    # --------------------------------------------------------
-
     score = 0.0
 
     score += (
-
-        p3
-        -
-        0.50
-
+        p3 - 0.50
     ) * 3.0
 
     score += (
-
-        p5
-        -
-        0.50
-
+        p5 - 0.50
     ) * 3.0
 
     score += (
-
         er3
         *
         20.0
-
     )
 
     score += (
-
         er5
         *
         15.0
-
     )
-
-    # --------------------------------------------------------
-    # Trend
-    # --------------------------------------------------------
 
     if trend > 0:
 
@@ -1781,10 +1766,6 @@ def calculate_score(
     elif trend < -0.03:
 
         score -= 0.20
-
-    # --------------------------------------------------------
-    # Volume
-    # --------------------------------------------------------
 
     if volume >= 1.20:
 
@@ -1798,33 +1779,17 @@ def calculate_score(
 
         score -= 0.10
 
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
-    if (
-
-        50.0
-        <=
-        rsi_value
-        <=
-        68.0
-
-    ):
+    if 50 <= rsi <= 68:
 
         score += 0.10
 
-    elif rsi_value > 72.0:
+    elif rsi > 72:
 
         score -= 0.15
 
-    elif rsi_value < 40.0:
+    elif rsi < 40:
 
         score -= 0.05
-
-    # --------------------------------------------------------
-    # Market regime
-    # --------------------------------------------------------
 
     if regime == "FAVORABLE":
 
@@ -1838,9 +1803,9 @@ def calculate_score(
 
         score -= 0.50
 
-    # --------------------------------------------------------
-    # Numerical safety
-    # --------------------------------------------------------
+    elif regime == "UNKNOWN":
+
+        score -= 0.20
 
     if not np.isfinite(score):
 
@@ -1850,7 +1815,7 @@ def calculate_score(
 
 
 # ============================================================
-# CANDIDATE EVALUATION
+# CANDIDATE
 # ============================================================
 
 def evaluate_candidate(
@@ -1860,26 +1825,16 @@ def evaluate_candidate(
 ):
 
     price = safe_float(
-        row.get(
-            "Close"
-        )
+        row.get("Close")
     )
 
-    rsi_value = safe_float(
-        row.get(
-            "rsi"
-        )
+    rsi = safe_float(
+        row.get("rsi")
     )
 
     volume = safe_float(
-        row.get(
-            "volume_ratio"
-        )
+        row.get("volume_ratio")
     )
-
-    # --------------------------------------------------------
-    # Trend fix
-    # --------------------------------------------------------
 
     trend = safe_float(
 
@@ -1888,11 +1843,8 @@ def evaluate_candidate(
             "trend",
 
             row.get(
-
                 "dist_sma50",
-
                 0.0
-
             )
 
         ),
@@ -1902,45 +1854,30 @@ def evaluate_candidate(
     )
 
     p3 = safe_float(
-        row.get(
-            "p3"
-        )
+        row.get("p3")
     )
 
     p5 = safe_float(
-        row.get(
-            "p5"
-        )
+        row.get("p5")
     )
 
     er3 = safe_float(
-        row.get(
-            "er3"
-        )
+        row.get("er3")
     )
 
     er5 = safe_float(
-        row.get(
-            "er5"
-        )
+        row.get("er5")
     )
 
     quality = safe_float(
-        row.get(
-            "quality"
-        )
+        row.get("quality")
     )
 
     levels = calculate_trade_levels(
 
         price,
-
-        row.get(
-            "atr_pct"
-        ),
-
+        row.get("atr_pct"),
         er3,
-
         er5
 
     )
@@ -1949,28 +1886,26 @@ def evaluate_candidate(
 
         return None
 
-    (
-        shares,
-        exposure,
-        planned_loss
-    ) = position_size(
+    shares, exposure, planned_loss = (
 
-        price,
+        position_size(
 
-        levels["stop"]
+            price,
+            levels["stop"]
+
+        )
 
     )
 
     score = calculate_score(
 
         row,
-
         regime
 
     )
 
     # --------------------------------------------------------
-    # Filters
+    # Individual filters
     # --------------------------------------------------------
 
     checks = {
@@ -1979,36 +1914,28 @@ def evaluate_candidate(
             (
                 np.isfinite(p3)
                 and
-                p3
-                >=
-                MIN_CALIBRATED_P3
+                p3 >= MIN_P3
             ),
 
         "p5":
             (
                 np.isfinite(p5)
                 and
-                p5
-                >=
-                MIN_CALIBRATED_P5
+                p5 >= MIN_P5
             ),
 
         "er3":
             (
                 np.isfinite(er3)
                 and
-                er3
-                >=
-                MIN_NET_ER3
+                er3 >= MIN_ER3
             ),
 
         "er5":
             (
                 np.isfinite(er5)
                 and
-                er5
-                >=
-                MIN_NET_ER5
+                er5 >= MIN_ER5
             ),
 
         "rr1":
@@ -2029,43 +1956,38 @@ def evaluate_candidate(
             (
                 np.isfinite(quality)
                 and
-                quality
-                >=
-                0.25
+                quality >= MIN_QUALITY
             ),
 
         "trend":
             (
                 np.isfinite(trend)
                 and
-                trend
-                >
-                -0.03
+                trend > -0.03
             ),
 
         "rsi":
             (
-                np.isfinite(rsi_value)
+                np.isfinite(rsi)
                 and
-                rsi_value
-                <=
-                MAX_RSI
+                rsi <= MAX_RSI
             ),
 
         "volume":
             (
                 np.isfinite(volume)
                 and
-                volume
-                >=
-                MIN_VOLUME_RATIO
+                volume >= MIN_VOLUME_RATIO
             ),
 
         "regime":
             (
                 regime
-                !=
-                "UNFAVORABLE"
+                in
+                (
+                    "FAVORABLE",
+                    "MIXED"
+                )
             ),
 
     }
@@ -2077,41 +1999,26 @@ def evaluate_candidate(
         for key, value
         in checks.items()
 
-        if not bool(value)
+        if not value
 
     ]
 
-    all_pass = all(
-
-        bool(value)
-
-        for value
-        in checks.values()
-
+    passed = sum(
+        bool(v)
+        for v in checks.values()
     )
 
     pass_rate = (
-
-        sum(
-
-            bool(value)
-
-            for value
-            in checks.values()
-
-        )
-
+        passed
         /
-
         len(checks)
-
     )
 
     # --------------------------------------------------------
     # Classification
     # --------------------------------------------------------
 
-    if all_pass:
+    if all(checks.values()):
 
         action = "TRADE"
 
@@ -2124,12 +2031,13 @@ def evaluate_candidate(
         action = "REJECT"
 
     # --------------------------------------------------------
-    # Extra safety:
-    #
-    # No TRADE if the market is unfavourable.
+    # UNKNOWN/UNFAVORABLE regime can NEVER create a trade.
     # --------------------------------------------------------
 
-    if regime == "UNFAVORABLE":
+    if regime in (
+        "UNKNOWN",
+        "UNFAVORABLE"
+    ):
 
         action = "REJECT"
 
@@ -2142,15 +2050,17 @@ def evaluate_candidate(
             price,
 
         "raw_p3":
-            row.get(
-                "raw_p3",
-                np.nan
+            safe_float(
+                row.get(
+                    "raw_p3"
+                )
             ),
 
         "raw_p5":
-            row.get(
-                "raw_p5",
-                np.nan
+            safe_float(
+                row.get(
+                    "raw_p5"
+                )
             ),
 
         "p3":
@@ -2166,7 +2076,7 @@ def evaluate_candidate(
             er5,
 
         "rsi":
-            rsi_value,
+            rsi,
 
         "volume_ratio":
             volume,
@@ -2219,7 +2129,7 @@ def evaluate_candidate(
 
 
 # ============================================================
-# IPO DATA
+# IPO
 # ============================================================
 
 def get_ipo_information():
@@ -2275,11 +2185,8 @@ def get_ipo_information():
         if response.status_code != 200:
 
             print(
-
                 "IPO HTTP status:",
-
                 response.status_code
-
             )
 
             return []
@@ -2330,14 +2237,11 @@ def get_ipo_information():
                     str(name)
                 )
 
-        # Remove duplicates
-        results = list(
+        return list(
             dict.fromkeys(
                 results
             )
-        )
-
-        return results[:10]
+        )[:10]
 
     except Exception as exc:
 
@@ -2359,9 +2263,7 @@ def telegram_send(message):
         os.getenv(
             "TELEGRAM_BOT_TOKEN"
         )
-
         or
-
         os.getenv(
             "BOT_TOKEN"
         )
@@ -2373,9 +2275,7 @@ def telegram_send(message):
         os.getenv(
             "TELEGRAM_CHAT_ID"
         )
-
         or
-
         os.getenv(
             "CHAT_ID"
         )
@@ -2398,20 +2298,6 @@ def telegram_send(message):
         chat_id
     ).strip()
 
-    if (
-
-        not bot_token
-        or
-        not chat_id
-
-    ):
-
-        print(
-            "Telegram credentials are empty."
-        )
-
-        return False
-
     url = (
 
         "https://api.telegram.org/"
@@ -2419,23 +2305,21 @@ def telegram_send(message):
 
     )
 
-    payload = {
-
-        "chat_id":
-            chat_id,
-
-        "text":
-            message,
-
-    }
-
     try:
 
         response = requests.post(
 
             url,
 
-            json=payload,
+            json={
+
+                "chat_id":
+                    chat_id,
+
+                "text":
+                    message,
+
+            },
 
             timeout=20
 
@@ -2444,13 +2328,9 @@ def telegram_send(message):
         if response.status_code != 200:
 
             print(
-
                 "Telegram error:",
-
                 response.status_code,
-
                 response.text
-
             )
 
             return False
@@ -2471,25 +2351,18 @@ def telegram_send(message):
 
 
 # ============================================================
-# ALERT BUILDER
+# ALERT
 # ============================================================
 
 def build_alert(
-
     market,
-
     candidates,
-
     ipo_names,
-
     trading_day
-
 ):
 
     now = datetime.now().strftime(
-
         "%d %b %Y, %H:%M IST"
-
     )
 
     lines = [
@@ -2528,6 +2401,11 @@ def build_alert(
             f"{format_money(market['vix'])}"
         ),
 
+        (
+            f"REGIME REASON: "
+            f"{market['reason']}"
+        ),
+
         "",
 
         "--- TOP SHORT-TERM TRADE SETUPS ---",
@@ -2536,33 +2414,32 @@ def build_alert(
 
     trades = [
 
-        item
+        x for x in candidates
 
-        for item
-        in candidates
-
-        if item["action"]
-        ==
-        "TRADE"
+        if x["action"] == "TRADE"
 
     ]
 
-    watches = [
+    watches = sorted(
 
-        item
+        [
 
-        for item
-        in candidates
+            x for x in candidates
 
-        if item["action"]
-        ==
-        "WATCH"
+            if x["action"] == "WATCH"
 
-    ]
+        ],
 
-    # ========================================================
-    # WEEKEND
-    # ========================================================
+        key=lambda x:
+            x["score"],
+
+        reverse=True
+
+    )
+
+    # --------------------------------------------------------
+    # MARKET CLOSED
+    # --------------------------------------------------------
 
     if not trading_day:
 
@@ -2579,17 +2456,35 @@ def build_alert(
 
         ]
 
-    # ========================================================
-    # TRADE SETUPS
-    # ========================================================
+    # --------------------------------------------------------
+    # UNKNOWN REGIME
+    # --------------------------------------------------------
 
-    if trades:
+    elif market["regime"] == "UNKNOWN":
 
-        for index, item in enumerate(
+        lines += [
 
-            trades[
-                :MAX_TOP_PICKS
-            ],
+            "",
+
+            "NO TRADE — MARKET REGIME UNKNOWN",
+
+            (
+                "Required Nifty/SMA50 data could "
+                "not be validated. The engine will "
+                "not force a trade."
+            ),
+
+        ]
+
+    # --------------------------------------------------------
+    # TRADE
+    # --------------------------------------------------------
+
+    if trades and trading_day:
+
+        for i, item in enumerate(
+
+            trades[:3],
 
             start=1
 
@@ -2600,7 +2495,7 @@ def build_alert(
                 "",
 
                 (
-                    f"{index}. "
+                    f"{i}. "
                     f"{item['symbol']} — TRADE"
                 ),
 
@@ -2610,22 +2505,13 @@ def build_alert(
                 ),
 
                 (
-                    "Calibrated P(UP) "
-                    "3D / 5D: "
+                    f"P(UP) 3D / 5D: "
                     f"{item['p3']:.1%} / "
                     f"{item['p5']:.1%}"
                 ),
 
                 (
-                    "Raw analogue P(UP) "
-                    "3D / 5D: "
-                    f"{item['raw_p3']:.1%} / "
-                    f"{item['raw_p5']:.1%}"
-                ),
-
-                (
-                    "Expected return "
-                    "3D / 5D: "
+                    f"Expected return 3D / 5D: "
                     f"{item['er3']:.2%} / "
                     f"{item['er5']:.2%}"
                 ),
@@ -2681,7 +2567,7 @@ def build_alert(
 
             ]
 
-    else:
+    elif trading_day:
 
         lines += [
 
@@ -2690,16 +2576,16 @@ def build_alert(
             "NO VALID LONG TRADE TODAY",
 
             (
-                "No candidate currently satisfies "
-                "the V6.3.6 probability, expected-return, "
-                "risk/reward and market filters."
+                "No candidate satisfies all required "
+                "probability, expected-return, "
+                "risk/reward and market-regime filters."
             ),
 
         ]
 
-    # ========================================================
+    # --------------------------------------------------------
     # WATCHLIST
-    # ========================================================
+    # --------------------------------------------------------
 
     lines += [
 
@@ -2711,31 +2597,26 @@ def build_alert(
 
     if watches:
 
-        watches = sorted(
+        for i, item in enumerate(
 
-            watches,
-
-            key=lambda x:
-                x["score"],
-
-            reverse=True
-
-        )
-
-        for index, item in enumerate(
-
-            watches[:3],
+            watches[:MAX_WATCH_RESULTS],
 
             start=1
 
         ):
+
+            failed = (
+                item["failed"]
+                or
+                "none"
+            )
 
             lines += [
 
                 "",
 
                 (
-                    f"{index}. "
+                    f"{i}. "
                     f"{item['symbol']} — WATCH"
                 ),
 
@@ -2745,23 +2626,20 @@ def build_alert(
                 ),
 
                 (
-                    "Calibrated P(UP) "
-                    "3D / 5D: "
+                    f"P3 / P5: "
                     f"{item['p3']:.1%} / "
                     f"{item['p5']:.1%}"
                 ),
 
                 (
-                    "Expected return "
-                    "3D / 5D: "
+                    f"ER3 / ER5: "
                     f"{item['er3']:.2%} / "
                     f"{item['er5']:.2%}"
                 ),
 
                 (
-                    f"RR1: "
-                    f"{item['rr1']:.2f}"
-                    f" | RR2: "
+                    f"RR1 / RR2: "
+                    f"{item['rr1']:.2f} / "
                     f"{item['rr2']:.2f}"
                 ),
 
@@ -2773,8 +2651,8 @@ def build_alert(
                 ),
 
                 (
-                    f"Score: "
-                    f"{item['score']:.3f}"
+                    f"Failed filters: "
+                    f"{failed}"
                 ),
 
                 "Action: WATCH / WAIT",
@@ -2787,9 +2665,9 @@ def build_alert(
             "None."
         )
 
-    # ========================================================
+    # --------------------------------------------------------
     # IPO
-    # ========================================================
+    # --------------------------------------------------------
 
     lines += [
 
@@ -2812,9 +2690,7 @@ def build_alert(
         for name in ipo_names:
 
             lines.append(
-
                 f"• {name}"
-
             )
 
     else:
@@ -2833,9 +2709,9 @@ def build_alert(
 
         ]
 
-    # ========================================================
+    # --------------------------------------------------------
     # DISCLAIMER
-    # ========================================================
+    # --------------------------------------------------------
 
     lines += [
 
@@ -2848,15 +2724,15 @@ def build_alert(
         ),
 
         (
-            "P(UP) is an empirical calibrated "
-            "estimate, not a guaranteed "
-            "probability of profit."
+            "P(UP) is an empirical estimate, "
+            "not a guaranteed probability "
+            "of profit."
         ),
 
         (
             "Verify live price, liquidity, "
             "corporate news, market status "
-            "and order execution before trading."
+            "and execution before trading."
         ),
 
     ]
@@ -2867,7 +2743,7 @@ def build_alert(
 
 
 # ============================================================
-# MAIN ENGINE
+# MAIN
 # ============================================================
 
 def main():
@@ -2885,22 +2761,18 @@ def main():
     )
 
     print(
-
         f"Configured capital: "
         f"{format_money(CAPITAL)}"
-
     )
 
     print(
-
         f"Maximum risk/trade: "
         f"{MAX_RISK_PCT:.2%}"
-
     )
 
-    signal_date = clean_date(
+    signal_date = pd.Timestamp(
         datetime.now()
-    )
+    ).normalize()
 
     trading_day = is_trading_day()
 
@@ -2921,39 +2793,27 @@ def main():
     ]
 
     print(
-
         f"Downloading data for "
         f"{len(tickers)} instruments..."
-
     )
 
-    try:
+    raw = yf.download(
 
-        raw = yf.download(
+        tickers=tickers,
 
-            tickers=tickers,
+        period="3y",
 
-            period="3y",
+        interval="1d",
 
-            interval="1d",
+        auto_adjust=True,
 
-            auto_adjust=True,
+        group_by="column",
 
-            group_by="column",
+        progress=False,
 
-            progress=False,
+        threads=True,
 
-            threads=True,
-
-        )
-
-    except Exception as exc:
-
-        raise RuntimeError(
-
-            f"Market data download failed: {exc}"
-
-        )
+    )
 
     frames = split_download(
         raw
@@ -2966,15 +2826,13 @@ def main():
         )
 
     print(
-
         f"Downloaded frames: "
         f"{len(frames)}"
-
     )
 
-    # ========================================================
-    # MARKET REGIME
-    # ========================================================
+    # --------------------------------------------------------
+    # MARKET
+    # --------------------------------------------------------
 
     market = market_regime(
 
@@ -2985,24 +2843,35 @@ def main():
     )
 
     print(
-
         f"Market regime: "
         f"{market['regime']}"
-
     )
 
-    # ========================================================
-    # FEATURE CALCULATION
-    # ========================================================
+    print(
+        f"Regime reason: "
+        f"{market['reason']}"
+    )
+
+    print(
+        f"Nifty: "
+        f"{format_money(market['nifty'])}"
+    )
+
+    print(
+        f"SMA50: "
+        f"{format_money(market['sma50'])}"
+    )
+
+    # --------------------------------------------------------
+    # FEATURES
+    # --------------------------------------------------------
 
     feature_frames = {}
 
     for symbol in SYMBOLS:
 
         df = frames.get(
-
             ticker(symbol)
-
         )
 
         if df is None or df.empty:
@@ -3020,29 +2889,23 @@ def main():
         except Exception as exc:
 
             print(
-
                 f"Feature error "
                 f"{symbol}: {exc}"
-
             )
 
     print(
-
         f"Stocks with features: "
         f"{len(feature_frames)}"
-
     )
 
-    # ========================================================
-    # MODEL EVALUATION
-    # ========================================================
+    # --------------------------------------------------------
+    # CANDIDATES
+    # --------------------------------------------------------
 
     candidates = []
 
     for symbol, features in (
-
         feature_frames.items()
-
     ):
 
         hist = features.loc[
@@ -3129,9 +2992,9 @@ def main():
                 candidate
             )
 
-    # ========================================================
+    # --------------------------------------------------------
     # SORT
-    # ========================================================
+    # --------------------------------------------------------
 
     candidates = sorted(
 
@@ -3152,32 +3015,68 @@ def main():
     )
 
     print(
-
         f"Candidates evaluated: "
         f"{len(candidates)}"
+    )
+
+    # --------------------------------------------------------
+    # COUNTS
+    # --------------------------------------------------------
+
+    trade_count = sum(
+
+        x["action"] == "TRADE"
+
+        for x in candidates
 
     )
 
-    # ========================================================
+    watch_count = sum(
+
+        x["action"] == "WATCH"
+
+        for x in candidates
+
+    )
+
+    reject_count = sum(
+
+        x["action"] == "REJECT"
+
+        for x in candidates
+
+    )
+
+    print(
+        f"TRADE: {trade_count}"
+    )
+
+    print(
+        f"WATCH: {watch_count}"
+    )
+
+    print(
+        f"REJECT: {reject_count}"
+    )
+
+    # --------------------------------------------------------
     # AUDIT
-    # ========================================================
-
-    audit = pd.DataFrame(
-        candidates
-    )
+    # --------------------------------------------------------
 
     timestamp = datetime.now().strftime(
-
         "%Y%m%d_%H%M%S"
-
     )
 
     audit_file = (
 
         AUDIT_DIR
         /
-        f"live_v6_3_6_{timestamp}.csv"
+        f"live_v6_3_7_{timestamp}.csv"
 
+    )
+
+    audit = pd.DataFrame(
+        candidates
     )
 
     if not audit.empty:
@@ -3191,29 +3090,26 @@ def main():
         )
 
         print(
-
             f"Audit saved: "
             f"{audit_file}"
-
         )
 
-    else:
-
-        print(
-            "No candidate audit rows generated."
-        )
-
-    # ========================================================
+    # --------------------------------------------------------
     # IPO
-    # ========================================================
+    # --------------------------------------------------------
 
     ipo_names = (
         get_ipo_information()
     )
 
-    # ========================================================
+    print(
+        f"IPO records: "
+        f"{len(ipo_names)}"
+    )
+
+    # --------------------------------------------------------
     # ALERT
-    # ========================================================
+    # --------------------------------------------------------
 
     message = build_alert(
 
@@ -3231,9 +3127,9 @@ def main():
     print(message)
     print("")
 
-    # ========================================================
+    # --------------------------------------------------------
     # TELEGRAM
-    # ========================================================
+    # --------------------------------------------------------
 
     telegram_send(
         message
