@@ -19,19 +19,28 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: "pip"
+
+      - name: Verify required files
+        run: |
+          echo "=============================================="
+          echo "CHECKING V6.3.13 FILES"
+          echo "=============================================="
+
+          test -f backtest_v6_3_13.py
+          test -f requirements_v6_3_13.txt
+
+          echo "backtest_v6_3_13.py: FOUND"
+          echo "requirements_v6_3_13.txt: FOUND"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          python -m pip install -r requirements_v6_3_13.txt
 
-          if [ -f requirements_v6_3_13.txt ]; then
-            pip install -r requirements_v6_3_13.txt
-          elif [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install pandas numpy yfinance requests
-          fi
+      - name: Validate V6.3.13 backtest syntax
+        run: |
+          python -m py_compile backtest_v6_3_13.py
+          echo "V6.3.13 backtest syntax validation PASSED"
 
       - name: Create audit directory
         run: |
