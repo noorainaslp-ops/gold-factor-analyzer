@@ -6,7 +6,7 @@ on:
 
   schedule:
 
-    # 10:30 AM IST = 05:00 UTC
+    # Approximately 10:30 AM IST, Monday-Friday
     - cron: "0 5 * * 1-5"
 
 
@@ -17,10 +17,6 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-
-      # IMPORTANT:
-      # These are deliberately explicit so that the Python
-      # program never receives an empty trading-capital value.
 
       TRADING_CAPITAL: "100000"
 
@@ -33,18 +29,10 @@ jobs:
 
     steps:
 
-      # ------------------------------------------------------
-      # CHECKOUT
-      # ------------------------------------------------------
-
       - name: Checkout repository
 
         uses: actions/checkout@v4
 
-
-      # ------------------------------------------------------
-      # PYTHON
-      # ------------------------------------------------------
 
       - name: Set up Python
 
@@ -57,10 +45,6 @@ jobs:
           cache: "pip"
 
 
-      # ------------------------------------------------------
-      # DEPENDENCIES
-      # ------------------------------------------------------
-
       - name: Install dependencies
 
         run: |
@@ -70,10 +54,6 @@ jobs:
           pip install -r requirements.txt
 
 
-      # ------------------------------------------------------
-      # VALIDATE PYTHON
-      # ------------------------------------------------------
-
       - name: Validate V6.3.6 engine
 
         run: |
@@ -81,20 +61,12 @@ jobs:
           python -m py_compile market_engine_v6_3_6.py
 
 
-      # ------------------------------------------------------
-      # RUN ENGINE
-      # ------------------------------------------------------
-
       - name: Run V6.3.6 market engine
 
         run: |
 
           python market_engine_v6_3_6.py
 
-
-      # ------------------------------------------------------
-      # SAVE AUDIT
-      # ------------------------------------------------------
 
       - name: Save audit history
 
