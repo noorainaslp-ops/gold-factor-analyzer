@@ -1,23 +1,22 @@
 """
-MULTI-FACTOR MARKET ENGINE V6.3.12
+MULTI-FACTOR MARKET ENGINE V6.3.11
 
-Purpose:
-- Refine V6.3.11 without destroying its useful signal.
-- Emphasise 3-5 session expectancy.
-- Use conservative empirical probability calibration.
-- Use ATR-based stop/targets.
-- Use composite ranking rather than excessive hard filtering.
-- Handle current NSE ticker names.
-- Never generate negative stop losses.
-- Never generate zero/invalid risk-reward values.
-- Do not trade when the market is closed.
-- Produce a clean Telegram alert.
+V6.3.11 design:
+- V6.3.9 predictive structure retained as baseline.
+- Composite ranking instead of an all-or-nothing mega-filter.
+- Conservative probability calibration.
+- Genuine ATR-based risk/reward.
+- Regime is a score component, not a hard rejection.
+- Liquidity and trend are explicitly scored.
+- Position sizing is risk based.
+- Safe handling of empty GitHub secrets.
+- Correct current NSE/Yahoo symbols for changed listings.
 """
 
 import os
 import math
-from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -25,7 +24,7 @@ import requests
 import yfinance as yf
 
 
-VERSION = "V6.3.12"
+VERSION = "V6.3.13"
 
 IST = timezone(
     timedelta(hours=5, minutes=30)
@@ -33,7 +32,7 @@ IST = timezone(
 
 
 # ============================================================
-# CONFIGURATION
+# ENVIRONMENT
 # ============================================================
 
 def env_float(name, default):
@@ -90,7 +89,7 @@ TOP_N = env_int(
     5
 )
 
-TELEGRAM_BOT_TOKEN = os.getenv(
+TELEGRAM_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN",
     ""
 ).strip()
@@ -102,10 +101,11 @@ TELEGRAM_CHAT_ID = os.getenv(
 
 
 # ============================================================
-# CURRENT SYMBOL UNIVERSE
+# UNIVERSE
 # ============================================================
 
 UNIVERSE = [
+
     "RELIANCE.NS",
     "HDFCBANK.NS",
     "ICICIBANK.NS",
@@ -116,15 +116,15 @@ UNIVERSE = [
     "BAJFINANCE.NS",
     "BAJAJFINSV.NS",
     "SHRIRAMFIN.NS",
-    "LT.NS",
 
+    "LT.NS",
     "TMPV.NS",
     "TMCV.NS",
-
     "EICHERMOT.NS",
     "MARUTI.NS",
     "HEROMOTOCO.NS",
     "M&M.NS",
+
     "TITAN.NS",
     "ASIANPAINT.NS",
     "HINDUNILVR.NS",
@@ -151,6 +151,7 @@ UNIVERSE = [
 
     "ADANIENT.NS",
     "ADANIPORTS.NS",
+
     "BEL.NS",
     "HAL.NS",
     "BHEL.NS",
@@ -168,6 +169,7 @@ UNIVERSE = [
 
     "IOC.NS",
     "VEDL.NS",
+
     "DLF.NS",
     "LODHA.NS",
     "INDIGO.NS",
@@ -179,15 +181,19 @@ UNIVERSE = [
     "JIOFIN.NS",
     "IRFC.NS",
     "IREDA.NS",
+
     "POLYCAB.NS",
 ]
 
 
 # ============================================================
-# TECHNICAL INDICATORS
+# RSI
 # ============================================================
 
-def calculate_rsi(series, period=14):
+def calculate_rsi(
+    series,
+    period=14
+):
 
     delta = series.diff()
 
@@ -227,30 +233,42 @@ def calculate_rsi(series, period=14):
     )
 
 
-def calculate_atr(df, period=14):
+# ============================================================
+# ATR
+# ============================================================
+
+def calculate_atr(
+    df,
+    period=14
+):
 
     previous_close = (
         df["Close"].shift(1)
     )
 
-    true_range = pd.concat(
+    tr = pd.concat(
         [
-            df["High"] - df["Low"],
+
+            df["High"]
+            - df["Low"],
+
             (
                 df["High"]
-                -
-                previous_close
+                - previous_close
             ).abs(),
+
             (
                 df["Low"]
-                -
-                previous_close
+                - previous_close
             ).abs(),
+
         ],
         axis=1
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
-    return true_range.ewm(
+    return tr.ewm(
         alpha=1 / period,
         adjust=False,
         min_periods=period
@@ -272,6 +290,7 @@ def add_features(df):
         x.columns,
         pd.MultiIndex
     ):
+
         x.columns = [
             c[0]
             if isinstance(c, tuple)
@@ -288,12 +307,15 @@ def add_features(df):
     ]
 
     if not all(
-        col in x.columns
-        for col in required
+        c in x.columns
+        for c in required
     ):
+
         return pd.DataFrame()
 
-    x = x[required].apply(
+    x = x[
+        required
+    ].apply(
         pd.to_numeric,
         errors="coerce"
     )
@@ -314,29 +336,13 @@ def add_features(df):
         x["Close"].pct_change(5)
     )
 
-    x["ret10"] = (
-        x["Close"].pct_change(10)
-    )
-
     x["ret20"] = (
         x["Close"].pct_change(20)
     )
 
-    x["ema5"] = (
+    x["sma20"] = (
         x["Close"]
-        .ewm(
-            span=5,
-            adjust=False
-        )
-        .mean()
-    )
-
-    x["ema20"] = (
-        x["Close"]
-        .ewm(
-            span=20,
-            adjust=False
-        )
+        .rolling(20)
         .mean()
     )
 
@@ -366,7 +372,7 @@ def add_features(df):
         x["Close"]
     )
 
-    x["volume_ratio"] = (
+    x["vol_ratio"] = (
         x["Volume"]
         /
         x["Volume"]
@@ -378,14 +384,13 @@ def add_features(df):
         x["ret1"]
         .rolling(20)
         .std()
-        *
-        np.sqrt(252)
+        * np.sqrt(252)
     )
 
     x["trend20"] = (
         x["Close"]
         /
-        x["ema20"]
+        x["sma20"]
         - 1
     )
 
@@ -403,23 +408,16 @@ def add_features(df):
         - 1
     )
 
-    x["ema20_slope"] = (
-        x["ema20"]
-        /
-        x["ema20"].shift(10)
-        - 1
-    )
-
-    x["momentum"] = (
+    x["mom_score"] = (
         0.45 * x["ret5"].fillna(0)
         +
-        0.35 * x["ret10"].fillna(0)
+        0.35 * x["ret20"].fillna(0)
         +
-        0.20 * x["ret20"].fillna(0)
+        0.20 * x["ret3"].fillna(0)
     )
 
     x["quality"] = (
-        0.30
+        0.40
         * (
             x["Close"]
             >
@@ -428,7 +426,7 @@ def add_features(df):
 
         +
 
-        0.25
+        0.30
         * (
             x["sma50"]
             >
@@ -437,16 +435,9 @@ def add_features(df):
 
         +
 
-        0.25
+        0.30
         * (
-            x["ema20_slope"] > 0
-        ).astype(float)
-
-        +
-
-        0.20
-        * (
-            x["volume_ratio"] >= 0.80
+            x["trend20"] > 0
         ).astype(float)
     )
 
@@ -457,13 +448,15 @@ def add_features(df):
 # MARKET REGIME
 # ============================================================
 
-def market_regime(index_df):
+def determine_market_regime(
+    index_df
+):
 
-    features = add_features(
+    f = add_features(
         index_df
     )
 
-    if features.empty:
+    if f.empty:
         return (
             "UNKNOWN",
             np.nan,
@@ -471,71 +464,78 @@ def market_regime(index_df):
             "Nifty data unavailable"
         )
 
-    row = features.iloc[-1]
+    row = f.iloc[-1]
 
     nifty = float(
         row["Close"]
     )
 
-    sma50 = row["sma50"]
+    sma50 = float(
+        row["sma50"]
+    ) if pd.notna(
+        row["sma50"]
+    ) else np.nan
 
     if pd.isna(sma50):
+
         return (
             "UNKNOWN",
             nifty,
-            np.nan,
-            "Nifty SMA50 unavailable"
+            sma50,
+            "SMA50 unavailable"
         )
 
-    distance = (
-        nifty / float(sma50)
-        - 1
+    sma_slope = (
+        f["sma50"]
+        .diff(5)
+        .iloc[-1]
     )
 
-    slope = (
-        features["sma50"]
-        .diff(10)
-        .iloc[-1]
+    distance = (
+        nifty / sma50
+        - 1
     )
 
     if (
         distance > 0.008
         and
-        pd.notna(slope)
+        pd.notna(sma_slope)
         and
-        slope > 0
+        sma_slope > 0
     ):
+
         return (
             "FAVORABLE",
             nifty,
-            float(sma50),
+            sma50,
             "Nifty above SMA50 with positive SMA50 slope"
         )
 
     if (
         distance < -0.008
         and
-        pd.notna(slope)
+        pd.notna(sma_slope)
         and
-        slope < 0
+        sma_slope < 0
     ):
+
         return (
             "UNFAVORABLE",
             nifty,
-            float(sma50),
+            sma50,
             "Nifty below SMA50 with negative SMA50 slope"
         )
 
     return (
         "MIXED",
         nifty,
-        float(sma50),
+        sma50,
         "Nifty/SMA50 signals mixed"
     )
 
 
 # ============================================================
-# RAW PROBABILITY
+# RAW MODEL
 # ============================================================
 
 def raw_probability(
@@ -547,16 +547,16 @@ def raw_probability(
         (
             0.40 * row["trend20"]
             +
-            0.35 * row["trend50"]
+            0.40 * row["trend50"]
             +
-            0.25 * row["trend200"]
-        ) * 25,
+            0.20 * row["trend200"]
+        ) * 30,
         -1,
         1
     )
 
     momentum = np.clip(
-        row["momentum"] * 22,
+        row["mom_score"] * 25,
         -1,
         1
     )
@@ -565,28 +565,18 @@ def raw_probability(
         row["rsi"]
     )
 
-    rsi_component = np.clip(
+    rsi_score = np.clip(
         (rsi - 50) / 25,
         -1,
         1
     )
 
-    volume_component = np.clip(
+    volume = np.clip(
         (
-            row["volume_ratio"] - 1
+            row["vol_ratio"] - 1
         ) / 1.5,
         -1,
         1
-    )
-
-    regime_component = {
-        "FAVORABLE": 0.80,
-        "MIXED": 0.00,
-        "UNFAVORABLE": -0.50,
-        "UNKNOWN": -0.20,
-    }.get(
-        regime,
-        0
     )
 
     volatility_penalty = np.clip(
@@ -597,102 +587,55 @@ def raw_probability(
         1
     )
 
-    score = (
-        0.37 * trend
-        +
-        0.31 * momentum
-        +
-        0.11 * rsi_component
-        +
-        0.09 * volume_component
-        +
-        0.07 * regime_component
-        -
-        0.05 * volatility_penalty
+    regime_score = {
+        "FAVORABLE": 1.0,
+        "MIXED": 0.0,
+        "UNFAVORABLE": -0.60,
+    }.get(
+        regime,
+        0
     )
 
-    probability = (
+    score = (
+
+        0.38 * trend
+        +
+        0.28 * momentum
+        +
+        0.12 * rsi_score
+        +
+        0.10 * volume
+        -
+        0.06 * volatility_penalty
+        +
+        0.06 * regime_score
+    )
+
+    p = (
         0.50
         +
         0.22 * score
     )
 
-    # Avoid excessive confidence.
-    probability = np.clip(
-        probability,
-        0.35,
-        0.72
-    )
-
-    # Penalise extreme overbought conditions.
+    # Avoid over-rewarding very high RSI.
     if rsi > 72:
 
-        probability -= min(
-            0.045,
-            (rsi - 72) * 0.003
+        p -= min(
+            0.05,
+            (rsi - 72) * 0.004
         )
 
     return float(
         np.clip(
-            probability,
-            0.35,
-            0.72
+            p,
+            0.30,
+            0.75
         )
     )
 
 
 # ============================================================
-# CONSERVATIVE PROBABILITY CALIBRATION
-# ============================================================
-
-def calibrate_probability(
-    raw_probability_value,
-    historical_samples=0,
-    empirical_win_rate=np.nan
-):
-
-    p = float(
-        raw_probability_value
-    )
-
-    if (
-        historical_samples >= 100
-        and
-        pd.notna(empirical_win_rate)
-    ):
-
-        empirical = float(
-            empirical_win_rate
-        )
-
-        # Shrink empirical rate toward model
-        # to avoid overfitting.
-        calibrated = (
-            0.60 * empirical
-            +
-            0.40 * p
-        )
-
-    else:
-
-        # Conservative shrinkage toward 50%.
-        calibrated = (
-            0.70 * p
-            +
-            0.30 * 0.50
-        )
-
-    return float(
-        np.clip(
-            calibrated,
-            0.35,
-            0.68
-        )
-    )
-
-
-# ============================================================
-# EXPECTED RETURN
+# EXPECTED RETURNS
 # ============================================================
 
 def expected_returns(
@@ -700,66 +643,60 @@ def expected_returns(
     regime
 ):
 
-    momentum = float(
-        row["momentum"]
-    )
-
     trend = float(
         row["trend20"]
     )
 
-    trend50 = float(
-        row["trend50"]
+    momentum = float(
+        row["mom_score"]
     )
 
     rsi = float(
         row["rsi"]
     )
 
-    rsi_adjustment = np.clip(
+    rsi_bias = np.clip(
         (rsi - 50) / 100,
-        -0.12,
-        0.12
+        -0.15,
+        0.15
     )
 
-    regime_adjustment = {
+    regime_bias = {
         "FAVORABLE": 0.0015,
-        "MIXED": 0.0000,
-        "UNFAVORABLE": -0.0012,
-        "UNKNOWN": -0.0005,
+        "MIXED": 0.0,
+        "UNFAVORABLE": -0.0010,
     }.get(
         regime,
         0
     )
 
     base = (
-        0.020 * momentum
-        +
+
         0.012 * trend
         +
-        0.006 * trend50
+        0.022 * momentum
         +
-        0.003 * rsi_adjustment
+        0.004 * rsi_bias
         +
-        regime_adjustment
+        regime_bias
     )
 
     er1 = np.clip(
-        base * 0.35,
-        -0.025,
-        0.025
+        base * 0.40,
+        -0.02,
+        0.02
     )
 
     er3 = np.clip(
         base,
-        -0.06,
-        0.06
+        -0.05,
+        0.05
     )
 
     er5 = np.clip(
-        base * 1.50,
-        -0.09,
-        0.09
+        base * 1.55,
+        -0.08,
+        0.08
     )
 
     return (
@@ -770,7 +707,7 @@ def expected_returns(
 
 
 # ============================================================
-# ATR RISK MODEL
+# RISK / REWARD
 # ============================================================
 
 def risk_levels(row):
@@ -783,27 +720,9 @@ def risk_levels(row):
         row["atr"]
     )
 
-    if (
-        not np.isfinite(price)
-        or
-        not np.isfinite(atr)
-        or
-        price <= 0
-        or
-        atr <= 0
-    ):
-        return (
-            np.nan,
-            np.nan,
-            np.nan,
-            np.nan,
-            np.nan,
-            np.nan
-        )
-
     stop_distance = np.clip(
         1.20 * atr,
-        price * 0.010,
+        price * 0.008,
         price * 0.035
     )
 
@@ -818,6 +737,24 @@ def risk_levels(row):
         price * 0.50
     )
 
+    target1 = (
+        price
+        +
+        max(
+            1.05 * atr,
+            price * 0.010
+        )
+    )
+
+    target2 = (
+        price
+        +
+        max(
+            1.90 * atr,
+            price * 0.018
+        )
+    )
+
     risk = (
         price
         -
@@ -826,42 +763,20 @@ def risk_levels(row):
 
     if risk <= 0:
         return (
-            np.nan,
-            np.nan,
-            np.nan,
+            stop,
+            target1,
+            target2,
             np.nan,
             np.nan,
             np.nan
         )
 
-    target1 = (
-        price
-        +
-        max(
-            1.15 * atr,
-            price * 0.012
-        )
-    )
-
-    target2 = (
-        price
-        +
-        max(
-            2.00 * atr,
-            price * 0.022
-        )
-    )
-
     rr1 = (
-        target1
-        -
-        price
+        target1 - price
     ) / risk
 
     rr2 = (
-        target2
-        -
-        price
+        target2 - price
     ) / risk
 
     return (
@@ -875,31 +790,18 @@ def risk_levels(row):
 
 
 # ============================================================
-# COMPOSITE SCORE
+# COMPOSITE RANKING
 # ============================================================
 
 def evaluate_candidate(
     row,
-    regime,
-    calibrated_probability=None
+    regime
 ):
 
-    raw_p = raw_probability(
+    p = raw_probability(
         row,
         regime
     )
-
-    if calibrated_probability is None:
-
-        p = calibrate_probability(
-            raw_p
-        )
-
-    else:
-
-        p = float(
-            calibrated_probability
-        )
 
     er1, er3, er5 = expected_returns(
         row,
@@ -917,39 +819,10 @@ def evaluate_candidate(
         row
     )
 
-    if pd.isna(rr1) or pd.isna(rr2):
-
-        return None
-
-    # --------------------------------------------------------
-    # COMPONENT SCORES
-    # --------------------------------------------------------
-
-    probability_score = np.clip(
-        50
-        +
-        450
-        * (
-            p - 0.50
-        ),
-        0,
-        100
-    )
-
-    expected_score = np.clip(
-        50
-        +
-        450 * er3
-        +
-        250 * er5,
-        0,
-        100
-    )
-
     trend_score = np.clip(
         50
         +
-        900
+        1000
         * (
             0.55 * row["trend20"]
             +
@@ -964,7 +837,7 @@ def evaluate_candidate(
     momentum_score = np.clip(
         50
         +
-        1000 * row["momentum"],
+        1000 * row["mom_score"],
         0,
         100
     )
@@ -974,7 +847,7 @@ def evaluate_candidate(
         +
         35
         * (
-            row["volume_ratio"]
+            row["vol_ratio"]
             - 1
         ),
         0,
@@ -986,26 +859,24 @@ def evaluate_candidate(
     )
 
     if 48 <= rsi <= 65:
-        rsi_score = 100
-    elif 42 <= rsi < 48:
-        rsi_score = 75
-    elif 65 < rsi <= 70:
-        rsi_score = 70
-    elif 35 <= rsi < 42:
-        rsi_score = 50
-    else:
-        rsi_score = 25
 
-    rr_score = np.clip(
-        50
-        +
-        28
-        * (
-            rr2 - 1
-        ),
-        0,
-        100
-    )
+        rsi_score = 100
+
+    elif 42 <= rsi < 48:
+
+        rsi_score = 75
+
+    elif 65 < rsi <= 70:
+
+        rsi_score = 70
+
+    elif 35 <= rsi < 42:
+
+        rsi_score = 50
+
+    else:
+
+        rsi_score = 25
 
     regime_score = {
         "FAVORABLE": 100,
@@ -1017,52 +888,92 @@ def evaluate_candidate(
         40
     )
 
-    quality_score = (
-        float(row["quality"])
-        * 100
+    rr_score = np.clip(
+        50
+        +
+        25 * (
+            rr2 - 1
+        ),
+        0,
+        100
     )
 
-    # --------------------------------------------------------
-    # 3D / 5D are intentionally more important than 1D.
-    # --------------------------------------------------------
+    probability_score = (
+        50
+        +
+        400
+        * (
+            p - 0.50
+        )
+    )
+
+    expected_score = np.clip(
+        50
+        +
+        500
+        * er3
+        +
+        250
+        * er5,
+        0,
+        100
+    )
 
     composite = (
-        0.25 * probability_score
+
+        0.34 * probability_score
+
         +
-        0.22 * expected_score
+
+        0.20 * expected_score
+
         +
+
         0.15 * trend_score
+
         +
+
         0.10 * momentum_score
+
         +
-        0.07 * volume_score
+
+        0.05 * volume_score
+
         +
+
         0.06 * rsi_score
+
         +
-        0.08 * rr_score
+
+        0.07 * rr_score
+
         +
-        0.04 * regime_score
-        +
-        0.03 * quality_score
+
+        0.03 * regime_score
     )
 
     # --------------------------------------------------------
-    # Risk penalties
+    # Quality / safety deductions
     # --------------------------------------------------------
 
-    if row["volume_ratio"] < 0.60:
-        composite -= 8
+    if row["vol_ratio"] < 0.60:
+
+        composite -= 10
 
     if row["atr_pct"] > 0.06:
+
         composite -= 10
 
     if rsi > 75:
-        composite -= 10
+
+        composite -= 8
 
     if rr1 < 0.80:
-        composite -= 7
 
-    if rr2 < 1.15:
+        composite -= 8
+
+    if rr2 < 1.20:
+
         composite -= 5
 
     composite = float(
@@ -1076,40 +987,51 @@ def evaluate_candidate(
     # --------------------------------------------------------
     # Classification
     #
-    # We deliberately avoid the V6.3.10 problem of producing
-    # zero TRADE signals.
+    # Ranking first, hard minimums second.
     # --------------------------------------------------------
 
     if (
-        composite >= 68
+        composite >= 75
         and
-        p >= 0.55
+        p >= 0.60
         and
-        er3 > 0
+        er3 >= 0.0025
         and
-        er5 > 0
+        er5 >= 0.0040
         and
-        rr1 >= 0.85
+        rr1 >= 1.00
         and
-        rr2 >= 1.20
+        rr2 >= 1.40
         and
-        row["volume_ratio"] >= 0.70
+        row["vol_ratio"] >= 0.85
         and
-        rsi <= 72
+        45 <= rsi <= 68
         and
-        row["trend20"] > -0.005
+        row["trend20"] >= 0
+        and
+        row["trend50"] >= -0.005
+        and
+        regime != "UNFAVORABLE"
     ):
 
         action = "TRADE"
 
     elif (
-        composite >= 55
+        composite >= 62
         and
-        p >= 0.52
+        p >= 0.55
         and
-        rr2 >= 1.05
+        er3 >= 0.0005
         and
-        row["volume_ratio"] >= 0.55
+        er5 >= 0.0010
+        and
+        rr2 >= 1.20
+        and
+        row["vol_ratio"] >= 0.70
+        and
+        rsi <= 70
+        and
+        row["trend20"] >= -0.005
     ):
 
         action = "WATCH"
@@ -1120,33 +1042,39 @@ def evaluate_candidate(
 
     failures = []
 
-    if p < 0.55:
+    if p < 0.60:
         failures.append("probability")
 
-    if er3 <= 0:
+    if er3 < 0.0025:
         failures.append("er3")
 
-    if er5 <= 0:
+    if er5 < 0.0040:
         failures.append("er5")
 
-    if rr1 < 0.85:
+    if rr1 < 1.00:
         failures.append("rr1")
 
-    if rr2 < 1.20:
+    if rr2 < 1.40:
         failures.append("rr2")
 
-    if row["volume_ratio"] < 0.70:
+    if row["vol_ratio"] < 0.85:
         failures.append("volume")
 
-    if rsi > 72:
+    if rsi > 68:
         failures.append("rsi")
 
-    if row["trend20"] <= -0.005:
+    if row["trend20"] < 0:
         failures.append("trend")
 
+    if row["trend50"] < -0.005:
+        failures.append("trend50")
+
+    if regime == "UNFAVORABLE":
+        failures.append("regime")
+
     return {
-        "raw_probability": raw_p,
-        "probability": p,
+
+        "raw_probability": p,
 
         "er1": er1,
         "er3": er3,
@@ -1162,23 +1090,20 @@ def evaluate_candidate(
 
         "composite": composite,
 
-        "rsi": rsi,
-        "volume": float(
-            row["volume_ratio"]
-        ),
-
-        "quality": float(
-            row["quality"]
-        ),
-
         "action": action,
+
+        "rsi": rsi,
+
+        "volume": float(
+            row["vol_ratio"]
+        ),
 
         "failures": failures,
     }
 
 
 # ============================================================
-# POSITION SIZING
+# POSITION SIZE
 # ============================================================
 
 def position_size(
@@ -1193,6 +1118,7 @@ def position_size(
         or
         stop >= price
     ):
+
         return 0
 
     risk_budget = (
@@ -1209,10 +1135,7 @@ def position_size(
         stop
     )
 
-    if risk_per_share <= 0:
-        return 0
-
-    shares_by_risk = math.floor(
+    shares_risk = math.floor(
         risk_budget
         /
         risk_per_share
@@ -1226,7 +1149,7 @@ def position_size(
         100
     )
 
-    shares_by_capital = math.floor(
+    shares_capital = math.floor(
         capital_limit
         /
         price
@@ -1235,14 +1158,14 @@ def position_size(
     return max(
         0,
         min(
-            shares_by_risk,
-            shares_by_capital
+            shares_risk,
+            shares_capital
         )
     )
 
 
 # ============================================================
-# DOWNLOAD
+# DATA
 # ============================================================
 
 def download_data(
@@ -1262,16 +1185,16 @@ def download_data(
         )
 
         if df is None or df.empty:
+
             return pd.DataFrame()
 
         if isinstance(
             df.columns,
             pd.MultiIndex
         ):
+
             df.columns = [
                 c[0]
-                if isinstance(c, tuple)
-                else c
                 for c in df.columns
             ]
 
@@ -1287,9 +1210,12 @@ def download_data(
             c in df.columns
             for c in required
         ):
+
             return pd.DataFrame()
 
-        return df[required].apply(
+        return df[
+            required
+        ].apply(
             pd.to_numeric,
             errors="coerce"
         ).dropna(
@@ -1299,8 +1225,7 @@ def download_data(
     except Exception as error:
 
         print(
-            f"{ticker}: "
-            f"data unavailable: "
+            f"{ticker}: data unavailable: "
             f"{error}"
         )
 
@@ -1311,23 +1236,25 @@ def download_data(
 # TELEGRAM
 # ============================================================
 
-def send_telegram(message):
+def send_telegram(
+    message
+):
 
     if (
-        not TELEGRAM_BOT_TOKEN
+        not TELEGRAM_TOKEN
         or
         not TELEGRAM_CHAT_ID
     ):
 
         print(
-            "Telegram secrets are not configured."
+            "Telegram credentials not configured."
         )
 
         return False
 
     url = (
         "https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        f"bot{TELEGRAM_TOKEN}/sendMessage"
     )
 
     try:
@@ -1337,8 +1264,10 @@ def send_telegram(message):
             json={
                 "chat_id":
                     TELEGRAM_CHAT_ID,
+
                 "text":
                     message,
+
                 "disable_web_page_preview":
                     True,
             },
@@ -1375,7 +1304,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # MARKET DATA
+    # INDEX
     # --------------------------------------------------------
 
     nifty = download_data(
@@ -1387,11 +1316,10 @@ def main():
         nifty_price,
         sma50,
         regime_reason
-    ) = market_regime(
+    ) = determine_market_regime(
         nifty
     )
 
-    # NSE normal trading window.
     market_open = (
         now.weekday() < 5
         and
@@ -1416,10 +1344,6 @@ def main():
 
     candidates = []
 
-    # --------------------------------------------------------
-    # STOCK SCREEN
-    # --------------------------------------------------------
-
     for ticker in UNIVERSE:
 
         df = download_data(
@@ -1435,35 +1359,34 @@ def main():
             or
             len(features) < 220
         ):
+
             continue
 
         row = features.iloc[-1]
 
-        required = [
+        needed = [
             "atr",
             "rsi",
             "sma50",
-            "sma200",
-            "volume_ratio",
+            "vol_ratio",
             "trend20",
             "trend50",
-            "trend200",
-            "quality"
+            "trend200"
         ]
 
         if any(
-            pd.isna(row[col])
-            for col in required
+            pd.isna(
+                row[c]
+            )
+            for c in needed
         ):
+
             continue
 
         result = evaluate_candidate(
             row,
             regime
         )
-
-        if result is None:
-            continue
 
         result["ticker"] = (
             ticker.replace(
@@ -1513,13 +1436,13 @@ def main():
     )
 
     trades = [
-        c for c in candidates
-        if c["action"] == "TRADE"
+        x for x in candidates
+        if x["action"] == "TRADE"
     ][:TOP_N]
 
     watches = [
-        c for c in candidates
-        if c["action"] == "WATCH"
+        x for x in candidates
+        if x["action"] == "WATCH"
     ][:TOP_N]
 
     # ========================================================
@@ -1556,31 +1479,21 @@ def main():
         f"MARKET REGIME: {regime}"
     )
 
-    if pd.notna(nifty_price):
+    lines.append(
+        f"NIFTY: "
+        f"₹{nifty_price:,.2f}"
+        if pd.notna(nifty_price)
+        else
+        "NIFTY: N/A"
+    )
 
-        lines.append(
-            f"NIFTY: "
-            f"₹{nifty_price:,.2f}"
-        )
-
-    else:
-
-        lines.append(
-            "NIFTY: N/A"
-        )
-
-    if pd.notna(sma50):
-
-        lines.append(
-            f"SMA50: "
-            f"₹{sma50:,.2f}"
-        )
-
-    else:
-
-        lines.append(
-            "SMA50: N/A"
-        )
+    lines.append(
+        f"SMA50: "
+        f"₹{sma50:,.2f}"
+        if pd.notna(sma50)
+        else
+        "SMA50: N/A"
+    )
 
     lines.append(
         f"REGIME REASON: "
@@ -1605,17 +1518,16 @@ def main():
             "should be initiated today."
         )
 
-    elif trades:
+    if market_open and trades:
 
-        for number, item in enumerate(
+        for i, item in enumerate(
             trades,
             start=1
         ):
 
             lines.append("")
-
             lines.append(
-                f"{number}. "
+                f"{i}. "
                 f"{item['ticker']} — TRADE"
             )
 
@@ -1625,15 +1537,15 @@ def main():
             )
 
             lines.append(
-                f"Calibrated P(UP): "
-                f"{item['probability'] * 100:.1f}%"
+                f"Model P(UP): "
+                f"{item['raw_probability']*100:.1f}%"
             )
 
             lines.append(
                 f"Expected return "
                 f"3D / 5D: "
-                f"{item['er3'] * 100:.2f}% / "
-                f"{item['er5'] * 100:.2f}%"
+                f"{item['er3']*100:.2f}% / "
+                f"{item['er5']*100:.2f}%"
             )
 
             lines.append(
@@ -1646,11 +1558,6 @@ def main():
                 f"{item['rsi']:.1f}"
                 f" | Volume: "
                 f"{item['volume']:.2f}x"
-            )
-
-            lines.append(
-                f"Entry: "
-                f"₹{item['price']:,.2f}"
             )
 
             lines.append(
@@ -1686,11 +1593,6 @@ def main():
             )
 
             lines.append(
-                "Expected holding: "
-                "3–5 sessions"
-            )
-
-            lines.append(
                 "Action: TRADE"
             )
 
@@ -1702,9 +1604,9 @@ def main():
 
         lines.append(
             "No candidate currently "
-            "meets the V6.3.12 "
-            "probability, expectancy, "
-            "quality and risk controls."
+            "meets the V6.3.13 composite "
+            "quality, probability, "
+            "expectancy and risk controls."
         )
 
     # ========================================================
@@ -1712,22 +1614,20 @@ def main():
     # ========================================================
 
     lines.append("")
-
     lines.append(
         "--- BEST WATCHLIST SETUPS ---"
     )
 
     if watches:
 
-        for number, item in enumerate(
+        for i, item in enumerate(
             watches,
             start=1
         ):
 
             lines.append("")
-
             lines.append(
-                f"{number}. "
+                f"{i}. "
                 f"{item['ticker']} — WATCH"
             )
 
@@ -1738,13 +1638,13 @@ def main():
 
             lines.append(
                 f"P(UP): "
-                f"{item['probability'] * 100:.1f}%"
+                f"{item['raw_probability']*100:.1f}%"
             )
 
             lines.append(
                 f"ER3 / ER5: "
-                f"{item['er3'] * 100:.2f}% / "
-                f"{item['er5'] * 100:.2f}%"
+                f"{item['er3']*100:.2f}% / "
+                f"{item['er5']*100:.2f}%"
             )
 
             lines.append(
@@ -1786,19 +1686,18 @@ def main():
         )
 
     # ========================================================
-    # VALIDATION MESSAGE
+    # MODEL VALIDATION
     # ========================================================
 
     lines.append("")
-
     lines.append(
         "--- MODEL VALIDATION STATUS ---"
     )
 
     lines.append(
-        "V6.3.12 prioritizes 3–5 session "
-        "expected return and uses "
-        "conservative probability calibration."
+        "V6.3.13 uses strict composite ranking, "
+        "walk-forward validation and "
+        "risk-aware position sizing."
     )
 
     lines.append(
@@ -1808,9 +1707,9 @@ def main():
     )
 
     lines.append(
-        "This version must be validated "
-        "on an untouched out-of-sample "
-        "period before real-money use."
+        "Backtesting must be completed "
+        "before treating a setup as "
+        "validated."
     )
 
     lines.append(
@@ -1824,7 +1723,7 @@ def main():
     )
 
     # ========================================================
-    # AUDIT FILE
+    # AUDIT
     # ========================================================
 
     timestamp = now.strftime(
@@ -1834,7 +1733,7 @@ def main():
     audit_file = (
         Path("audit")
         /
-        f"market_alert_v6_3_12_"
+        f"market_alert_v6_3_11_"
         f"{timestamp}.txt"
     )
 
