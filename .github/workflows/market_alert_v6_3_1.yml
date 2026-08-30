@@ -1,6 +1,7 @@
-name: Market Alert V6.3
+name: Market Alert V6.3.1
 
 on:
+
   workflow_dispatch:
 
   schedule:
@@ -19,14 +20,14 @@ jobs:
     steps:
 
       # ======================================================
-      # 1. CHECKOUT REPOSITORY
+      # 1. CHECKOUT
       # ======================================================
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
       # ======================================================
-      # 2. SET UP PYTHON
+      # 2. PYTHON
       # ======================================================
 
       - name: Set up Python
@@ -34,77 +35,80 @@ jobs:
         with:
           python-version: "3.12"
           cache: "pip"
-          cache-dependency-path: requirements_v6_3.txt
+          cache-dependency-path: requirements_v6_3_1.txt
 
       # ======================================================
-      # 3. INSTALL DEPENDENCIES
+      # 3. DEPENDENCIES
       # ======================================================
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements_v6_3.txt
+          python -m pip install -r requirements_v6_3_1.txt
 
       # ======================================================
-      # 4. VERIFY REQUIRED FILES
+      # 4. VERIFY FILES
       # ======================================================
 
-      - name: Verify V6.3 files
+      - name: Verify V6.3.1 files
         run: |
-          echo "======================================"
-          echo "REPOSITORY CONTENT"
-          echo "======================================"
+          echo "=========================================="
+          echo "REPOSITORY"
+          echo "=========================================="
+
           pwd
           ls -la
 
           echo ""
-          echo "======================================"
+          echo "=========================================="
           echo "WORKFLOW DIRECTORY"
-          echo "======================================"
+          echo "=========================================="
+
           ls -la .github/workflows
 
           echo ""
-          echo "======================================"
-          echo "CHECKING V6.3 FILES"
-          echo "======================================"
+          echo "=========================================="
+          echo "CHECKING REQUIRED FILES"
+          echo "=========================================="
 
-          test -f market_engine_v6_3.py
-          test -f requirements_v6_3.txt
+          test -f market_engine_v6_3_1.py
+          test -f requirements_v6_3_1.txt
 
-          echo "market_engine_v6_3.py FOUND"
-          echo "requirements_v6_3.txt FOUND"
+          echo ""
+          echo "market_engine_v6_3_1.py FOUND"
+          echo "requirements_v6_3_1.txt FOUND"
 
       # ======================================================
-      # 5. VALIDATE PYTHON SYNTAX
+      # 5. PYTHON SYNTAX
       # ======================================================
 
-      - name: Validate Market Engine V6.3
+      - name: Validate Market Engine V6.3.1
         run: |
-          python -m py_compile market_engine_v6_3.py
-          echo "V6.3 syntax validation PASSED."
+          python -m py_compile market_engine_v6_3_1.py
+          echo "V6.3.1 syntax validation PASSED."
 
       # ======================================================
-      # 6. RUN MARKET ENGINE
+      # 6. RUN ENGINE
       # ======================================================
 
-      - name: Run Market Alert V6.3
+      - name: Run Market Alert V6.3.1
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           CAPITAL: ${{ secrets.CAPITAL }}
         run: |
-          python market_engine_v6_3.py
+          python market_engine_v6_3_1.py
 
       # ======================================================
-      # 7. SHOW GENERATED FILES
+      # 7. SHOW OUTPUT
       # ======================================================
 
       - name: Show generated files
         if: always()
         run: |
-          echo "======================================"
+          echo "=========================================="
           echo "GENERATED FILES"
-          echo "======================================"
+          echo "=========================================="
 
           ls -lah
 
@@ -113,23 +117,23 @@ jobs:
           ls -lah *.csv 2>/dev/null || true
 
       # ======================================================
-      # 8. SAVE AUDIT HISTORY
+      # 8. SAVE HISTORY
       # ======================================================
 
-      - name: Save audit history
+      - name: Save V6.3.1 audit history
         if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add alert_history_v6_3.csv 2>/dev/null || true
-          git add candidate_history_v6_3.csv 2>/dev/null || true
-          git add rejected_candidates_v6_3.csv 2>/dev/null || true
-          git add backtest_v6_3.csv 2>/dev/null || true
+          git add alert_history_v6_3_1.csv 2>/dev/null || true
+          git add candidate_history_v6_3_1.csv 2>/dev/null || true
+          git add rejected_candidates_v6_3_1.csv 2>/dev/null || true
+          git add backtest_v6_3_1.csv 2>/dev/null || true
 
           if git diff --cached --quiet; then
             echo "No history changes to commit."
           else
-            git commit -m "Update V6.3 market alert history"
+            git commit -m "Update V6.3.1 market alert history"
             git push
           fi
