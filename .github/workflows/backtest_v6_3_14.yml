@@ -1,0 +1,55 @@
+name: V6.3.14 Chronological Walk-Forward Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify required files
+        run: |
+          test -f backtest_v6_3_14.py
+          test -f market_engine_v6_3_14.py
+          test -f requirements_v6_3_14.txt
+          python -m py_compile market_engine_v6_3_14.py
+          python -m py_compile backtest_v6_3_14.py
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements_v6_3_14.txt
+
+      - name: Create audit directory
+        run: mkdir -p audit
+
+      - name: Run V6.3.14 chronological walk-forward backtest
+        run: python backtest_v6_3_14.py
+
+      - name: Display audit files
+        if: always()
+        run: |
+          echo "=============================================="
+          echo "V6.3.14 AUDIT FILES"
+          echo "=============================================="
+          find audit -maxdepth 1 -type f -print | sort || true
+
+      - name: Upload V6.3.14 backtest results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: v6-3-14-backtest-results
+          path: audit/**
+          if-no-files-found: warn
+          retention-days: 90
