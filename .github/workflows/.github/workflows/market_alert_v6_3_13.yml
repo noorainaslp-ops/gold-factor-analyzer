@@ -1,0 +1,67 @@
+name: V6.3.13 Market Alert
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # 09:30 IST = 04:00 UTC
+    - cron: "0 4 * * 1-5"
+
+    # 15:30 IST = 10:00 UTC
+    - cron: "0 10 * * 1-5"
+
+permissions:
+  contents: write
+
+jobs:
+  market-alert:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements_v6_3_13.txt ]; then
+            pip install -r requirements_v6_3_13.txt
+          elif [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas numpy yfinance requests
+          fi
+
+      - name: Run V6.3.13 market engine
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          ALERT_CAPITAL: ${{ secrets.ALERT_CAPITAL }}
+          MAX_RISK_PCT: ${{ secrets.MAX_RISK_PCT }}
+          MAX_POSITION_PCT: ${{ secrets.MAX_POSITION_PCT }}
+
+          SLIPPAGE_BPS: ${{ secrets.SLIPPAGE_BPS }}
+          ROUND_TRIP_COST_BPS: ${{ secrets.ROUND_TRIP_COST_BPS }}
+
+          TOP_N: "5"
+
+        run: |
+          python market_engine_v6_3_13.py
+
+      - name: Upload audit files
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: v6-3-13-market-alert-audit-${{ github.run_number }}
+          path: |
+            audit/**
+          if-no-files-found: ignore
+          retention-days: 30
