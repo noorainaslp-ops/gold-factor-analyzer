@@ -4,21 +4,26 @@ MARKET ENGINE V6.2
 
 Indian short-term equity screening engine.
 
-Purpose:
-- Identify liquid Indian stocks with favourable short-term setups.
-- Combine 1D / 3D / 5D model forecasts.
-- Use calibrated directional probabilities.
-- Incorporate market regime, relative strength,
-  volume, RSI, ATR and trend alignment.
-- Produce entry, stop-loss and profit targets.
-- Calculate position size from risk.
-- Maintain candidate/rejection/alert history.
-- Send Telegram alerts.
-- Run a walk-forward backtest.
+Features:
+- Nifty 500 universe with fallback list
+- Multi-horizon 1D / 3D / 5D return models
+- Probability calibration
+- Market-regime filter
+- Trend and relative-strength filters
+- RSI / ATR / volume / volatility controls
+- Risk-adjusted ranking
+- Entry range
+- Stop-loss
+- Target 1 / Target 2
+- Risk/reward
+- Position sizing
+- Candidate/rejection history
+- Telegram alerts
+- Walk-forward backtesting
 
 IMPORTANT:
 This is a probabilistic research/screening system.
-It does not guarantee profits or investment returns.
+It does not guarantee profit or investment returns.
 """
 
 from __future__ import annotations
@@ -146,7 +151,6 @@ class EngineConfig:
 
     fallback_universe: list = field(
         default_factory=lambda: [
-
             "RELIANCE.NS",
             "TCS.NS",
             "HDFCBANK.NS",
@@ -280,7 +284,7 @@ FEATURES = [
 
 
 # ============================================================
-# BASIC HELPERS
+# HELPERS
 # ============================================================
 
 def now_ist() -> datetime:
@@ -295,7 +299,7 @@ def safe_float(value, default=np.nan):
 
 
 # ============================================================
-# MARKET DATA
+# DATA DOWNLOAD
 # ============================================================
 
 def download_ohlcv(
@@ -352,11 +356,9 @@ def download_ohlcv(
                 ):
 
                     if field in level0:
-
                         result[field] = raw[field]
 
                     elif field in level1:
-
                         result[field] = raw.xs(
                             field,
                             axis=1,
@@ -375,7 +377,6 @@ def download_ohlcv(
                 ):
 
                     if field in raw.columns:
-
                         result[field] = raw[[field]]
 
             if "Close" not in result:
@@ -405,7 +406,7 @@ def download_ohlcv(
 
 
 # ============================================================
-# NIFTY UNIVERSE
+# NIFTY 500 UNIVERSE
 # ============================================================
 
 def load_nifty500_universe(fallback):
@@ -505,12 +506,9 @@ def rsi(series, period=14):
         .mean()
     )
 
-    rs = (
-        gain
-        / loss.replace(
-            0,
-            np.nan,
-        )
+    rs = gain / loss.replace(
+        0,
+        np.nan,
     )
 
     return (
@@ -553,7 +551,7 @@ def atr(
 
 
 # ============================================================
-# FEATURES
+# FEATURE ENGINEERING
 # ============================================================
 
 def build_features(
@@ -761,9 +759,7 @@ def fit_models(
     cfg,
 ):
 
-    target = (
-        f"target{horizon}"
-    )
+    target = f"target{horizon}"
 
     x = (
         training[FEATURES]
@@ -788,10 +784,6 @@ def fit_models(
 
     if y.nunique() < 2:
         return None
-
-    # --------------------------------------------------------
-    # Time-ordered calibration split
-    # --------------------------------------------------------
 
     cut = int(
         len(x) * 0.80
@@ -854,6 +846,15 @@ def fit_models(
         ).astype(int),
     )
 
+    # --------------------------------------------------------
+    # Probability calibration
+    #
+    # IMPORTANT:
+    # Keep the complete .astype().to_numpy() chain
+    # inside one expression. This fixes the syntax error
+    # encountered in the previous version.
+    # --------------------------------------------------------
+
     calibration_model = None
 
     try:
@@ -864,9 +865,10 @@ def fit_models(
         )
 
         actual = (
-            y_cal > 0
-        ).astype(int)
-        .to_numpy()
+            (y_cal > 0)
+            .astype(int)
+            .to_numpy()
+        )
 
         if (
             len(raw_probability) >= 100
@@ -894,7 +896,7 @@ def fit_models(
         )
 
     # --------------------------------------------------------
-    # Refit on complete available history
+    # Refit on all available historical data
     # --------------------------------------------------------
 
     return_model.fit(
@@ -920,7 +922,7 @@ def fit_models(
 
 
 # ============================================================
-# PROBABILITY
+# CALIBRATED PROBABILITY
 # ============================================================
 
 def calibrated_probability(
@@ -940,7 +942,9 @@ def calibrated_probability(
     try:
 
         return float(
-            calibrator.predict([raw])[0]
+            calibrator.predict(
+                [raw]
+            )[0]
         )
 
     except Exception:
@@ -1126,12 +1130,18 @@ def make_trade_plan(
 
     rr1 = (
         target1_pct
-        / max(risk_pct, 0.01)
+        / max(
+            risk_pct,
+            0.01,
+        )
     )
 
     rr2 = (
         target2_pct
-        / max(risk_pct, 0.01)
+        / max(
+            risk_pct,
+            0.01,
+        )
     )
 
     if (
@@ -1168,28 +1178,52 @@ def make_trade_plan(
 
     return {
         "Entry_Low":
-            round(entry_low, 2),
+            round(
+                entry_low,
+                2,
+            ),
 
         "Entry_High":
-            round(entry_high, 2),
+            round(
+                entry_high,
+                2,
+            ),
 
         "Stop_Loss":
-            round(stop, 2),
+            round(
+                stop,
+                2,
+            ),
 
         "Target_1":
-            round(target1, 2),
+            round(
+                target1,
+                2,
+            ),
 
         "Target_2":
-            round(target2, 2),
+            round(
+                target2,
+                2,
+            ),
 
         "Risk_Pct":
-            round(risk_pct, 2),
+            round(
+                risk_pct,
+                2,
+            ),
 
         "RR_T1":
-            round(rr1, 2),
+            round(
+                rr1,
+                2,
+            ),
 
         "RR_T2":
-            round(rr2, 2),
+            round(
+                rr2,
+                2,
+            ),
 
         "Tier":
             tier,
@@ -1311,7 +1345,7 @@ def add_position_size(
 
 
 # ============================================================
-# ENGINE
+# MARKET ENGINE
 # ============================================================
 
 class MarketEngineV62:
@@ -1321,7 +1355,7 @@ class MarketEngineV62:
         self.cfg = cfg
 
     # ========================================================
-    # SCAN
+    # STOCK SCAN
     # ========================================================
 
     def get_stock_picks(self):
@@ -1451,10 +1485,12 @@ class MarketEngineV62:
 
                 training_parts[
                     horizon
-                ].append(historical)
+                ].append(
+                    historical
+                )
 
         # ----------------------------------------------------
-        # Train
+        # Train models
         # ----------------------------------------------------
 
         models = {}
@@ -1488,7 +1524,7 @@ class MarketEngineV62:
         rows = []
 
         # ----------------------------------------------------
-        # Score
+        # Score stocks
         # ----------------------------------------------------
 
         for ticker, frame in frames.items():
@@ -1502,7 +1538,10 @@ class MarketEngineV62:
 
             x = row[FEATURES]
 
-            if x.isna().any(axis=1).iloc[0]:
+            if x.isna().any(
+                axis=1
+            ).iloc[0]:
+
                 continue
 
             predictions = {}
@@ -1512,7 +1551,9 @@ class MarketEngineV62:
                 self.cfg.short_horizons
             ):
 
-                bundle = models.get(horizon)
+                bundle = models.get(
+                    horizon
+                )
 
                 if bundle is None:
                     continue
@@ -1645,7 +1686,7 @@ class MarketEngineV62:
             )
 
             # ------------------------------------------------
-            # Trend / relative strength
+            # Trend
             # ------------------------------------------------
 
             trend_aligned = (
@@ -1734,31 +1775,41 @@ class MarketEngineV62:
             reasons = []
 
             if price < self.cfg.min_price:
-                reasons.append("price")
+                reasons.append(
+                    "price"
+                )
 
             if (
                 turnover_cr
                 < self.cfg.min_avg_turnover_cr
             ):
-                reasons.append("liquidity")
+                reasons.append(
+                    "liquidity"
+                )
 
             if (
                 predicted_pct
                 < self.cfg.min_pred_return_pct
             ):
-                reasons.append("expected return")
+                reasons.append(
+                    "expected return"
+                )
 
             if (
                 ensemble_probability
                 < self.cfg.min_probability
             ):
-                reasons.append("probability")
+                reasons.append(
+                    "probability"
+                )
 
             if (
                 score_pct
                 < self.cfg.min_score_pct
             ):
-                reasons.append("risk-adjusted score")
+                reasons.append(
+                    "risk-adjusted score"
+                )
 
             if reasons:
 
@@ -1776,7 +1827,10 @@ class MarketEngineV62:
                             ),
 
                         "price":
-                            round(price, 2),
+                            round(
+                                price,
+                                2,
+                            ),
 
                         "predicted_3d_pct":
                             round(
@@ -1797,7 +1851,9 @@ class MarketEngineV62:
                             ),
 
                         "reason":
-                            ", ".join(reasons),
+                            ", ".join(
+                                reasons
+                            ),
                     }
                 )
 
@@ -1812,7 +1868,10 @@ class MarketEngineV62:
                         ),
 
                     "Price":
-                        round(price, 2),
+                        round(
+                            price,
+                            2,
+                        ),
 
                     "Predicted_1D_Return_Pct":
                         round(
@@ -1901,7 +1960,8 @@ class MarketEngineV62:
 
                     "Relative_5D_Pct":
                         round(
-                            relative_strength * 100,
+                            relative_strength
+                            * 100,
                             2,
                         ),
 
@@ -1916,7 +1976,9 @@ class MarketEngineV62:
                 }
             )
 
-        self.log_rejected(rejected)
+        self.log_rejected(
+            rejected
+        )
 
         # ----------------------------------------------------
         # No trade
@@ -1928,8 +1990,11 @@ class MarketEngineV62:
                 [
                     {
                         "Ticker": "--",
+
                         "No_Trade": True,
+
                         "Tier": "NO TRADE",
+
                         "Action":
                             (
                                 "No candidate cleared "
@@ -1939,7 +2004,9 @@ class MarketEngineV62:
                 ]
             )
 
-            self.log_candidates(result)
+            self.log_candidates(
+                result
+            )
 
             return result
 
@@ -1947,7 +2014,9 @@ class MarketEngineV62:
         # Ranking
         # ----------------------------------------------------
 
-        df = pd.DataFrame(rows)
+        df = pd.DataFrame(
+            rows
+        )
 
         df = (
             df
@@ -1962,7 +2031,9 @@ class MarketEngineV62:
             .head(
                 self.cfg.top_n
             )
-            .reset_index(drop=True)
+            .reset_index(
+                drop=True
+            )
         )
 
         # ----------------------------------------------------
@@ -2002,8 +2073,7 @@ class MarketEngineV62:
 
         symbols = [
             symbol
-            for symbol
-            in symbols
+            for symbol in symbols
             if symbol in close.columns
         ]
 
@@ -2048,15 +2118,20 @@ class MarketEngineV62:
                 "avg_pairwise_correlation"
             ] = None
 
-        self.log_candidates(df)
+        self.log_candidates(
+            df
+        )
 
         return df
 
     # ========================================================
-    # HISTORY
+    # CANDIDATE HISTORY
     # ========================================================
 
-    def log_candidates(self, df):
+    def log_candidates(
+        self,
+        df,
+    ):
 
         try:
 
@@ -2098,7 +2173,14 @@ class MarketEngineV62:
                 exc,
             )
 
-    def log_rejected(self, rows):
+    # ========================================================
+    # REJECTED HISTORY
+    # ========================================================
+
+    def log_rejected(
+        self,
+        rows,
+    ):
 
         if not rows:
             return
@@ -2135,6 +2217,10 @@ class MarketEngineV62:
                 exc,
             )
 
+    # ========================================================
+    # ALERT HISTORY
+    # ========================================================
+
     def log_alert(
         self,
         picks,
@@ -2153,13 +2239,19 @@ class MarketEngineV62:
                         ),
 
                     "ticker":
-                        row.get("Ticker"),
+                        row.get(
+                            "Ticker"
+                        ),
 
                     "price":
-                        row.get("Price"),
+                        row.get(
+                            "Price"
+                        ),
 
                     "score_pct":
-                        row.get("Score_Pct"),
+                        row.get(
+                            "Score_Pct"
+                        ),
 
                     "predicted_3d_return_pct":
                         row.get(
@@ -2172,22 +2264,34 @@ class MarketEngineV62:
                         ),
 
                     "entry_low":
-                        row.get("Entry_Low"),
+                        row.get(
+                            "Entry_Low"
+                        ),
 
                     "entry_high":
-                        row.get("Entry_High"),
+                        row.get(
+                            "Entry_High"
+                        ),
 
                     "stop_loss":
-                        row.get("Stop_Loss"),
+                        row.get(
+                            "Stop_Loss"
+                        ),
 
                     "target_1":
-                        row.get("Target_1"),
+                        row.get(
+                            "Target_1"
+                        ),
 
                     "target_2":
-                        row.get("Target_2"),
+                        row.get(
+                            "Target_2"
+                        ),
 
                     "shares":
-                        row.get("Shares"),
+                        row.get(
+                            "Shares"
+                        ),
 
                     "position_value":
                         row.get(
@@ -2200,13 +2304,19 @@ class MarketEngineV62:
                         ),
 
                     "tier":
-                        row.get("Tier"),
+                        row.get(
+                            "Tier"
+                        ),
 
                     "action":
-                        row.get("Action"),
+                        row.get(
+                            "Action"
+                        ),
 
                     "regime":
-                        regime["label"],
+                        regime[
+                            "label"
+                        ],
                 }
             )
 
@@ -2243,10 +2353,13 @@ class MarketEngineV62:
             )
 
     # ========================================================
-    # TELEGRAM
+    # TELEGRAM FORMAT
     # ========================================================
 
-    def format_picks(self, picks):
+    def format_picks(
+        self,
+        picks,
+    ):
 
         lines = [
             "--- TOP SHORT-TERM MODEL PICKS "
@@ -2353,13 +2466,17 @@ class MarketEngineV62:
                 [
                     "",
                     (
-                        f"Average pick correlation: "
+                        "Average pick correlation: "
                         f"{correlation}"
                     ),
                 ]
             )
 
         return lines
+
+    # ========================================================
+    # TELEGRAM SEND
+    # ========================================================
 
     def send_telegram(
         self,
@@ -2380,8 +2497,8 @@ class MarketEngineV62:
 
         # ----------------------------------------------------
         # IMPORTANT:
-        # Timestamp is intentionally calculated separately.
-        # This avoids the nested f-string syntax problem.
+        # Timestamp is calculated separately.
+        # This avoids nested f-string formatting errors.
         # ----------------------------------------------------
 
         timestamp = now_ist().strftime(
@@ -2393,11 +2510,14 @@ class MarketEngineV62:
             f"_{timestamp}_",
             "",
             (
-                f"MARKET REGIME: {regime['label']}"
+                f"MARKET REGIME: "
+                f"{regime['label']}"
             ),
             (
-                f"NIFTY: {regime['nifty']:.2f} | "
-                f"SMA50: {regime['sma50']:.2f}"
+                f"NIFTY: "
+                f"{regime['nifty']:.2f} | "
+                f"SMA50: "
+                f"{regime['sma50']:.2f}"
             ),
         ]
 
@@ -2406,7 +2526,8 @@ class MarketEngineV62:
         ):
 
             lines.append(
-                f"INDIA VIX: {regime['vix']:.2f}"
+                f"INDIA VIX: "
+                f"{regime['vix']:.2f}"
             )
 
         lines.append("")
@@ -2437,17 +2558,22 @@ class MarketEngineV62:
 
                 lines.append(
                     (
-                        f"Dates: {ipo['start']} "
+                        f"Dates: "
+                        f"{ipo['start']} "
                         f"to {ipo['end']}"
                     )
                 )
 
                 if ipo.get("price"):
                     lines.append(
-                        f"Price: {ipo['price']}"
+                        f"Price: "
+                        f"{ipo['price']}"
                     )
 
-                if ipo.get("subscription"):
+                if ipo.get(
+                    "subscription"
+                ):
+
                     lines.append(
                         "Subscription: "
                         f"{ipo['subscription']}"
@@ -2484,7 +2610,9 @@ class MarketEngineV62:
             ]
         )
 
-        message = "\n".join(lines)
+        message = "\n".join(
+            lines
+        )
 
         url = (
             "https://api.telegram.org/"
@@ -2517,7 +2645,9 @@ class MarketEngineV62:
 # MARKET REGIME DATA
 # ============================================================
 
-def get_market_regime(cfg):
+def get_market_regime(
+    cfg,
+):
 
     data = download_ohlcv(
         [
@@ -2606,8 +2736,7 @@ def fetch_nse_ipos():
 
             text = " ".join(
                 str(c)
-                for c
-                in table.columns
+                for c in table.columns
             ).lower()
 
             if (
@@ -2623,8 +2752,7 @@ def fetch_nse_ipos():
 
         selected.columns = [
             str(c).strip()
-            for c
-            in selected.columns
+            for c in selected.columns
         ]
 
         results = []
@@ -2633,8 +2761,7 @@ def fetch_nse_ipos():
 
             values = [
                 str(v)
-                for v
-                in row.tolist()
+                for v in row.tolist()
             ]
 
             if not values:
@@ -2736,7 +2863,10 @@ def run_backtest(
         .dropna()
     )
 
-    if cfg.vix_ticker in close.columns:
+    if (
+        cfg.vix_ticker
+        in close.columns
+    ):
 
         vix = (
             close[
@@ -2786,27 +2916,37 @@ def run_backtest(
 
         return (
             pd.DataFrame(),
-            {"trades": 0},
+            {
+                "trades": 0
+            },
         )
 
-    dates = sorted(
-        set.intersection(
-            *[
-                set(frame.index)
-                for frame
-                in frames.values()
-            ]
+    common_dates = None
+
+    for frame in frames.values():
+
+        frame_dates = set(
+            frame.index
         )
+
+        if common_dates is None:
+            common_dates = frame_dates
+        else:
+            common_dates &= frame_dates
+
+    dates = sorted(
+        common_dates or []
     )
 
     if len(dates) < 800:
 
         return (
             pd.DataFrame(),
-            {"trades": 0},
+            {
+                "trades": 0
+            },
         )
 
-    # Test every 5th session to reduce computation.
     test_dates = dates[
         550:-6:5
     ]
@@ -2868,7 +3008,10 @@ def run_backtest(
 
             x = row[FEATURES]
 
-            if x.isna().any(axis=1).iloc[0]:
+            if x.isna().any(
+                axis=1
+            ).iloc[0]:
+
                 continue
 
             predictions = {}
@@ -2878,7 +3021,9 @@ def run_backtest(
                 cfg.short_horizons
             ):
 
-                bundle = models.get(horizon)
+                bundle = models.get(
+                    horizon
+                )
 
                 if bundle is None:
                     continue
@@ -2929,7 +3074,11 @@ def run_backtest(
             if price < cfg.min_price:
                 continue
 
-            if turnover_cr < cfg.min_avg_turnover_cr:
+            if (
+                turnover_cr
+                < cfg.min_avg_turnover_cr
+            ):
+
                 continue
 
             r1 = predictions.get(
@@ -2976,12 +3125,14 @@ def run_backtest(
                 predicted_pct
                 < cfg.min_pred_return_pct
             ):
+
                 continue
 
             if (
                 ensemble_probability
                 < cfg.min_probability
             ):
+
                 continue
 
             score = (
@@ -2996,7 +3147,9 @@ def run_backtest(
             )
 
             rsi_value = float(
-                row["rsi14"].iloc[0]
+                row[
+                    "rsi14"
+                ].iloc[0]
             )
 
             if rsi_value > 70:
@@ -3147,11 +3300,15 @@ def run_backtest(
 
         return (
             trades_df,
-            {"trades": 0},
+            {
+                "trades": 0
+            },
         )
 
     wins = (
-        trades_df["net_3d_pct"] > 0
+        trades_df[
+            "net_3d_pct"
+        ] > 0
     )
 
     profits = trades_df.loc[
@@ -3165,7 +3322,10 @@ def run_backtest(
     ]
 
     gross_profit = profits.sum()
-    gross_loss = -losses.sum()
+
+    gross_loss = (
+        -losses.sum()
+    )
 
     if gross_loss > 0:
 
@@ -3196,11 +3356,16 @@ def run_backtest(
     summary = {
 
         "trades":
-            int(len(trades_df)),
+            int(
+                len(
+                    trades_df
+                )
+            ),
 
         "hit_rate_pct":
             round(
-                wins.mean() * 100,
+                wins.mean()
+                * 100,
                 1,
             ),
 
@@ -3276,7 +3441,9 @@ def run_backtest(
 def main():
 
     parser = argparse.ArgumentParser(
-        description="Indian Market Engine V6.2"
+        description=(
+            "Indian Market Engine V6.2"
+        )
     )
 
     # --------------------------------------------------------
@@ -3292,14 +3459,22 @@ def main():
     parser.add_argument(
         "--backtest-period",
         default="5y",
-        help="Backtest period, e.g. 3y, 5y.",
+        help=(
+            "Backtest period, "
+            "e.g. 3y or 5y."
+        ),
     )
 
     # --------------------------------------------------------
     # CAPITAL
     #
     # IMPORTANT FIX:
-    # If CAPITAL is missing OR empty, use 100000.
+    #
+    # os.getenv("CAPITAL") can return an empty string
+    # when GitHub has a blank secret.
+    #
+    # "or 100000" converts that empty value into the
+    # safe default instead of attempting float("").
     # --------------------------------------------------------
 
     capital_environment = (
@@ -3313,7 +3488,7 @@ def main():
             capital_environment
         )
 
-    except ValueError:
+    except (ValueError, TypeError):
 
         log.warning(
             "Invalid CAPITAL value '%s'. "
@@ -3365,6 +3540,30 @@ def main():
     # CONFIG
     # --------------------------------------------------------
 
+    try:
+
+        top_n = int(
+            os.getenv(
+                "TOP_N",
+                "3",
+            )
+        )
+
+    except (
+        ValueError,
+        TypeError,
+    ):
+
+        top_n = 3
+
+    top_n = max(
+        1,
+        min(
+            top_n,
+            10,
+        ),
+    )
+
     cfg = EngineConfig(
 
         bot_token=os.getenv(
@@ -3377,12 +3576,7 @@ def main():
 
         capital=capital,
 
-        top_n=int(
-            os.getenv(
-                "TOP_N",
-                "3",
-            )
-        ),
+        top_n=top_n,
     )
 
     # ========================================================
@@ -3466,8 +3660,13 @@ def main():
     )
 
     log.info(
-        "Market Alert V6.2 completed successfully.")
+        "Market Alert V6.2 completed successfully."
+    )
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
