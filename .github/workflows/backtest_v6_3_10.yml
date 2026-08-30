@@ -1,0 +1,60 @@
+name: V6.3.10 Walk-Forward Backtest
+
+on:
+
+  workflow_dispatch:
+
+  schedule:
+    - cron: "30 3 * * 6"
+
+permissions:
+  contents: read
+
+jobs:
+
+  backtest:
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify V6.3.10 files
+        run: |
+          test -f market_engine_v6_3_10.py
+          test -f backtest_v6_3_10.py
+          test -f requirements.txt
+
+      - name: Validate market engine
+        run: |
+          python -m py_compile market_engine_v6_3_10.py
+
+      - name: Validate backtest
+        run: |
+          python -m py_compile backtest_v6_3_10.py
+
+      - name: Run V6.3.10 walk-forward backtest
+        run: |
+          python backtest_v6_3_10.py
+
+      - name: Save V6.3.10 backtest results
+        uses: actions/upload-artifact@v6
+        with:
+          name: v6-3-10-backtest-results
+          path: audit/
+          if-no-files-found: error
+          retention-days: 90
