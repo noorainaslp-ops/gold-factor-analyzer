@@ -24,7 +24,7 @@ from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V6.3.17"
+VERSION = "V6.3.17-FIXED"
 AUDIT = Path("audit")
 AUDIT.mkdir(exist_ok=True)
 
@@ -175,7 +175,7 @@ def ret_model():
     ])
 
 def fit(train):
-    train=train.dropna(subset=["y5","ret5_fwd"])
+    train=train.dropna(subset=["y5","ret5"])
     if len(train)<MIN_TRAIN or train.y5.nunique()<2:
         return None,None
 
@@ -183,7 +183,7 @@ def fit(train):
     r=ret_model()
 
     c.fit(train[FEATURES],train.y5.astype(int))
-    r.fit(train[FEATURES],train.ret5_fwd)
+    r.fit(train[FEATURES],train.ret5)
 
     return c,r
 
