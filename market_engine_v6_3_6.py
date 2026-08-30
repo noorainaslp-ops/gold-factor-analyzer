@@ -7,26 +7,28 @@ Purpose
 Generate short-term Indian equity opportunities for approximately
 1-5 trading sessions.
 
-V6.3.6 changes:
-    - Correct market-regime handling.
-    - Separates raw probability from calibrated probability.
-    - Uses empirical historical analogues.
-    - Expected return is required to be positive AFTER estimated costs.
-    - Risk/reward is calculated from actual model expectation.
-    - Never creates a negative stop-loss.
-    - Never manufactures a positive target when expected return is negative.
-    - Uses separate TRADE / WATCH / REJECT logic.
-    - Gives rejection reasons.
-    - Uses position sizing from capital and maximum risk.
-    - Weekend/holiday handling.
-    - Robust Yahoo Finance downloading.
-    - IPO retrieval is deliberately conservative.
-    - No future information is used when generating a signal.
+V6.3.6 features
+---------------
+- Correct market-regime handling.
+- MIXED regime is not automatically rejected.
+- Separates raw probability from calibrated probability.
+- Empirical analogue model.
+- Expected return is used as an important trade criterion.
+- Risk/reward calculated from valid positive stop/target levels.
+- Never produces a negative stop loss.
+- TRADE / WATCH / REJECT classification.
+- Position sizing based on configured capital and risk.
+- Weekend/non-trading-day handling.
+- Conservative IPO retrieval.
+- Telegram alert generation.
+- Audit CSV generation.
 
 IMPORTANT
 ---------
-This is a research screen, not financial advice.
-P(UP) is an empirical/calibrated estimate, not a guarantee.
+This is a probabilistic research screen.
+It does not guarantee profit.
+P(UP) is an empirical/calibrated estimate,
+not a guaranteed probability of profit.
 """
 
 from __future__ import annotations
@@ -78,7 +80,6 @@ MIN_RR1 = 1.00
 MIN_RR2 = 1.20
 
 MAX_RSI = 75.0
-
 MIN_VOLUME_RATIO = 0.80
 
 MAX_TOP_PICKS = 5
@@ -90,7 +91,7 @@ AUDIT_DIR.mkdir(
 
 
 # ============================================================
-# UNIVERSE
+# STOCK UNIVERSE
 # ============================================================
 
 SYMBOLS = [
@@ -182,6 +183,7 @@ def safe_float(
 
 
 def clean_date(value):
+
     ts = pd.Timestamp(value)
 
     if ts.tzinfo is not None:
@@ -191,6 +193,7 @@ def clean_date(value):
 
 
 def is_trading_day():
+
     now = datetime.now()
 
     return now.weekday() < 5
@@ -249,7 +252,9 @@ def split_download(raw):
         pd.MultiIndex
     ):
 
-        cleaned = clean_frame(raw)
+        cleaned = clean_frame(
+            raw
+        )
 
         if cleaned is not None:
             result["SINGLE"] = cleaned
@@ -268,8 +273,6 @@ def split_download(raw):
         .unique()
     )
 
-    # yfinance commonly returns:
-    # Price x Ticker
     if "Close" in levels0:
 
         for name in levels1:
@@ -288,7 +291,9 @@ def split_download(raw):
                 )
 
                 if cleaned is not None:
-                    result[str(name)] = cleaned
+                    result[
+                        str(name)
+                    ] = cleaned
 
             except Exception:
                 continue
@@ -311,7 +316,9 @@ def split_download(raw):
                 )
 
                 if cleaned is not None:
-                    result[str(name)] = cleaned
+                    result[
+                        str(name)
+                    ] = cleaned
 
             except Exception:
                 continue
@@ -605,9 +612,6 @@ def market_regime(
         and sma_current > sma_previous
     )
 
-    # IMPORTANT FIX:
-    # MIXED is NOT automatically rejected.
-
     if above and rising:
 
         regime = "FAVORABLE"
@@ -672,8 +676,6 @@ def analogue_model(
 
     candidate = data.iloc[-1]
 
-    # Remove observations whose future outcomes
-    # would not yet be known at signal time.
     train = data.iloc[:-6].copy()
 
     if len(train) < 100:
@@ -851,14 +853,6 @@ def analogue_model(
         0.07
     )
 
-    # --------------------------------------------------------
-    # Calibration
-    #
-    # Raw analogue probabilities tend to be overconfident.
-    # Shrink toward 50% rather than pretending that raw
-    # frequency is a perfectly calibrated probability.
-    # --------------------------------------------------------
-
     shrinkage = min(
         0.45,
         12.0 / max(
@@ -886,10 +880,6 @@ def analogue_model(
         shrinkage
         * 0.50
     )
-
-    # --------------------------------------------------------
-    # Quality
-    # --------------------------------------------------------
 
     dispersion_penalty3 = min(
         1.0,
@@ -965,7 +955,7 @@ def analogue_model(
 
 
 # ============================================================
-# RISK / TARGET
+# RISK / TARGET LEVELS
 # ============================================================
 
 def calculate_trade_levels(
@@ -975,10 +965,21 @@ def calculate_trade_levels(
     er5
 ):
 
-    price = safe_float(price)
-    atr_pct = safe_float(atr_pct)
-    er3 = safe_float(er3)
-    er5 = safe_float(er5)
+    price = safe_float(
+        price
+    )
+
+    atr_pct = safe_float(
+        atr_pct
+    )
+
+    er3 = safe_float(
+        er3
+    )
+
+    er5 = safe_float(
+        er5
+    )
 
     if (
         not np.isfinite(price)
@@ -989,7 +990,6 @@ def calculate_trade_levels(
 
         return None
 
-    # Conservative stop distance.
     stop_distance = min(
         0.05,
         max(
@@ -1000,13 +1000,13 @@ def calculate_trade_levels(
 
     stop = (
         price
-        * (
+        *
+        (
             1
             - stop_distance
         )
     )
 
-    # Never allow a negative/invalid stop.
     stop = max(
         0.01,
         stop
@@ -1017,8 +1017,9 @@ def calculate_trade_levels(
         - stop
     )
 
-    # Expected-return targets.
-    # Only positive expected returns can create targets.
+    if risk_per_share <= 0:
+        return None
+
     target1_return = max(
         0.0,
         min(
@@ -1093,8 +1094,13 @@ def position_size(
     stop
 ):
 
-    price = safe_float(price)
-    stop = safe_float(stop)
+    price = safe_float(
+        price
+    )
+
+    stop = safe_float(
+        stop
+    )
 
     if (
         not np.isfinite(price)
@@ -1102,7 +1108,11 @@ def position_size(
         or price <= stop
     ):
 
-        return 0, 0.0, 0.0
+        return (
+            0,
+            0.0,
+            0.0
+        )
 
     risk_budget = (
         CAPITAL
@@ -1281,21 +1291,22 @@ def evaluate_candidate(
     if levels is None:
         return None
 
-    shares, exposure, planned_loss = (
-        position_size(
-            price,
-            levels["stop"]
-        )
+    (
+        shares,
+        exposure,
+        planned_loss
+    ) = position_size(
+
+        price,
+
+        levels["stop"]
+
     )
 
     score = calculate_score(
         row,
         regime
     )
-
-    # --------------------------------------------------------
-    # FILTERS
-    # --------------------------------------------------------
 
     checks = {
 
@@ -1335,26 +1346,17 @@ def evaluate_candidate(
     }
 
     failed = [
-
         key
-
         for key, value
         in checks.items()
-
         if not bool(value)
-
     ]
-
-    # --------------------------------------------------------
-    # TRADE / WATCH
-    # --------------------------------------------------------
 
     all_pass = all(
         bool(x)
         for x in checks.values()
     )
 
-    # Watchlist should be useful even when not all filters pass.
     watch_score = (
         sum(
             bool(x)
@@ -1454,37 +1456,30 @@ def evaluate_candidate(
 
 
 # ============================================================
-# IPO RETRIEVAL
+# IPO INFORMATION
 # ============================================================
 
 def get_ipo_information():
-
-    """
-    Deliberately conservative IPO retrieval.
-
-    We do NOT manufacture IPO information.
-    If the external source cannot be verified, the alert says
-    that IPO data is unavailable.
-
-    This keeps the stock model from being contaminated by
-    fabricated/stale IPO data.
-    """
 
     url = (
         "https://www.nseindia.com/api/ipo-current-issue"
     )
 
     headers = {
+
         "User-Agent":
             "Mozilla/5.0 "
             "(Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 "
             "(KHTML, like Gecko) "
             "Chrome/120 Safari/537.36",
+
         "Accept":
             "application/json,text/plain,*/*",
+
         "Referer":
             "https://www.nseindia.com/",
+
     }
 
     try:
@@ -1540,6 +1535,7 @@ def get_ipo_information():
             )
 
             if name:
+
                 results.append(
                     str(name)
                 )
@@ -1552,7 +1548,7 @@ def get_ipo_information():
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM SEND
 # ============================================================
 
 def telegram_send(
@@ -1567,7 +1563,10 @@ def telegram_send(
         "TELEGRAM_CHAT_ID"
     )
 
-    if not bot_token or not chat_id:
+    if (
+        not bot_token
+        or not chat_id
+    ):
 
         print(
             "Telegram credentials "
@@ -1599,6 +1598,14 @@ def telegram_send(
             timeout=20
         )
 
+        if response.status_code != 200:
+
+            print(
+                "Telegram HTTP error:",
+                response.status_code,
+                response.text
+            )
+
         return (
             response.status_code == 200
         )
@@ -1613,22 +1620,28 @@ def telegram_send(
 
 
 # ============================================================
-# ALERT FORMAT
+# MONEY FORMAT
 # ============================================================
 
 def format_money(
     value
 ):
 
-    if not np.isfinite(
-        safe_float(value)
-    ):
+    value = safe_float(
+        value
+    )
+
+    if not np.isfinite(value):
         return "N/A"
 
     return (
-        f"₹{float(value):,.2f}"
+        f"₹{value:,.2f}"
     )
 
+
+# ============================================================
+# ALERT BUILDER
+# ============================================================
 
 def build_alert(
     market,
@@ -1703,7 +1716,10 @@ def build_alert(
 
             "MARKET IS CLOSED.",
 
-            "No new long position should be initiated today.",
+            (
+                "No new long position should "
+                "be initiated today."
+            ),
 
         ]
 
@@ -1729,12 +1745,29 @@ def build_alert(
                     f"{format_money(x['price'])}"
                 ),
 
+                # =================================================
+                # IMPORTANT CORRECTION:
+                #
+                # The model calculates 3D and 5D probabilities.
+                # It does NOT calculate a true 1D probability.
+                #
+                # Therefore DO NOT display:
+                # P(UP) 1D / 3D / 5D
+                #
+                # =================================================
+
                 (
                     "Calibrated P(UP) "
-                    f"1D / 3D / 5D: "
-                    f"{x['p3']:.1%} / "
+                    f"3D / 5D: "
                     f"{x['p3']:.1%} / "
                     f"{x['p5']:.1%}"
+                ),
+
+                (
+                    "Raw analogue P(UP) "
+                    f"3D / 5D: "
+                    f"{x['raw_p3']:.1%} / "
+                    f"{x['raw_p5']:.1%}"
                 ),
 
                 (
@@ -1784,7 +1817,8 @@ def build_alert(
                 (
                     f"Suggested position: "
                     f"{x['shares']} shares "
-                    f"≈ {format_money(x['exposure'])}"
+                    f"≈ "
+                    f"{format_money(x['exposure'])}"
                 ),
 
                 (
@@ -1820,13 +1854,15 @@ def build_alert(
 
     if watches:
 
+        sorted_watches = sorted(
+            watches,
+            key=lambda z:
+                z["score"],
+            reverse=True
+        )
+
         for i, x in enumerate(
-            sorted(
-                watches,
-                key=lambda z:
-                    z["score"],
-                reverse=True
-            )[:3],
+            sorted_watches[:3],
             start=1
         ):
 
@@ -1846,29 +1882,39 @@ def build_alert(
                 ),
 
                 (
-                    f"P3: {x['p3']:.1%} "
-                    f"| P5: {x['p5']:.1%}"
+                    "Calibrated P(UP) "
+                    f"3D / 5D: "
+                    f"{x['p3']:.1%} / "
+                    f"{x['p5']:.1%}"
                 ),
 
                 (
-                    f"E3: {x['er3']:.2%} "
-                    f"| E5: {x['er5']:.2%}"
+                    "Expected return "
+                    f"3D / 5D: "
+                    f"{x['er3']:.2%} / "
+                    f"{x['er5']:.2%}"
                 ),
 
                 (
-                    f"RR1: {x['rr1']:.2f} "
-                    f"| RR2: {x['rr2']:.2f}"
+                    f"RR1: "
+                    f"{x['rr1']:.2f} "
+                    f"| RR2: "
+                    f"{x['rr2']:.2f}"
                 ),
 
                 (
-                    f"RSI: {x['rsi']:.1f} "
-                    f"| Score: "
+                    f"RSI: "
+                    f"{x['rsi']:.1f} "
+                    f"| Volume: "
+                    f"{x['volume_ratio']:.2f}x"
+                ),
+
+                (
+                    f"Score: "
                     f"{x['score']:.3f}"
                 ),
 
-                (
-                    "Action: WATCH / WAIT"
-                ),
+                "Action: WATCH / WAIT",
 
             ]
 
@@ -1904,8 +1950,10 @@ def build_alert(
 
         lines += [
 
-            "IPO DATA UNAVAILABLE | "
-            "RETRIEVAL FAILED",
+            (
+                "IPO DATA UNAVAILABLE | "
+                "RETRIEVAL FAILED"
+            ),
 
             (
                 "Verify current/upcoming issues "
@@ -1938,7 +1986,9 @@ def build_alert(
 
     ]
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 # ============================================================
@@ -2123,19 +2173,22 @@ def main():
         candidates,
 
         key=lambda x: (
+
             1
             if x["action"] == "TRADE"
             else 0,
+
             x["score"],
+
         ),
 
         reverse=True
 
     )
 
-    # --------------------------------------------------------
-    # Save audit
-    # --------------------------------------------------------
+    # ========================================================
+    # AUDIT
+    # ========================================================
 
     audit = pd.DataFrame(
         candidates
@@ -2158,9 +2211,17 @@ def main():
             index=False
         )
 
+    # ========================================================
+    # IPO
+    # ========================================================
+
     ipo_names = (
         get_ipo_information()
     )
+
+    # ========================================================
+    # BUILD ALERT
+    # ========================================================
 
     message = build_alert(
 
@@ -2174,9 +2235,17 @@ def main():
 
     )
 
+    # ========================================================
+    # CONSOLE OUTPUT
+    # ========================================================
+
     print("")
     print(message)
     print("")
+
+    # ========================================================
+    # TELEGRAM
+    # ========================================================
 
     telegram_send(
         message
@@ -2184,4 +2253,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
