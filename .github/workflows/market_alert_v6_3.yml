@@ -1,0 +1,106 @@
+name: Market Alert V6.3
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # 10:30 AM IST = 05:00 UTC
+    - cron: "0 5 * * 1-5"
+
+permissions:
+  contents: write
+
+jobs:
+
+  market-alert:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ------------------------------------------------------
+      # CHECKOUT
+      # ------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------
+      # PYTHON
+      # ------------------------------------------------------
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      # ------------------------------------------------------
+      # DEPENDENCIES
+      # ------------------------------------------------------
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_v6_3.txt
+
+      # ------------------------------------------------------
+      # VERIFY FILES
+      # ------------------------------------------------------
+
+      - name: Verify V6.3 files
+        run: |
+          echo "Repository:"
+          pwd
+          echo ""
+          echo "Files:"
+          ls -la
+          echo ""
+          echo "Workflow files:"
+          ls -la .github/workflows
+          echo ""
+          test -f market_engine_v6_3.py
+          test -f requirements_v6_3.txt
+          echo "V6.3 files found."
+
+      # ------------------------------------------------------
+      # PYTHON SYNTAX VALIDATION
+      # ------------------------------------------------------
+
+      - name: Validate Market Engine V6.3
+        run: |
+          python -m py_compile market_engine_v6_3.py
+          echo "V6.3 syntax validation passed."
+
+      # ------------------------------------------------------
+      # RUN MARKET ENGINE
+      # ------------------------------------------------------
+
+      - name: Run Market Alert V6.3
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CAPITAL: ${{ secrets.CAPITAL }}
+        run: |
+          python market_engine_v6_3.py
+
+      # ------------------------------------------------------
+      # SAVE AUDIT HISTORY
+      # ------------------------------------------------------
+
+      - name: Save audit history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            alert_history_v6_3.csv \
+            candidate_history_v6_3.csv \
+            rejected_candidates_v6_3.csv \
+            backtest_v6_3.csv \
+            2>/dev/null || true
+
+          git diff --cached --quiet || \
+            git commit -m "Update V6.3 market alert history"
+
+          git push || true
