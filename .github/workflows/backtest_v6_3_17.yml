@@ -1,0 +1,126 @@
+name: V6.3.17 Chronological Walk-Forward Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  backtest:
+    name: V6.3.17 Backtest
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+
+      # ======================================================
+      # CHECKOUT
+      # ======================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # ======================================================
+      # PYTHON
+      # ======================================================
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements_v6_3_17.txt
+
+      # ======================================================
+      # VERIFY FILES
+      # ======================================================
+
+      - name: Verify V6.3.17 files
+        run: |
+          echo "=============================================="
+          echo "V6.3.17 FILE VERIFICATION"
+          echo "=============================================="
+
+          test -f backtest_v6_3_17.py
+          test -f requirements_v6_3_17.txt
+
+          echo "backtest_v6_3_17.py found"
+          echo "requirements_v6_3_17.txt found"
+
+      # ======================================================
+      # PYTHON SYNTAX CHECK
+      # ======================================================
+
+      - name: Compile V6.3.17 backtest
+        run: |
+          python -m py_compile backtest_v6_3_17.py
+
+          echo "V6.3.17 Python syntax check passed."
+
+      # ======================================================
+      # INSTALL DEPENDENCIES
+      # ======================================================
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements_v6_3_17.txt
+
+      # ======================================================
+      # CREATE AUDIT DIRECTORY
+      # ======================================================
+
+      - name: Create audit directory
+        run: |
+          mkdir -p audit
+
+      # ======================================================
+      # RUN BACKTEST
+      # ======================================================
+
+      - name: Run V6.3.17 chronological walk-forward backtest
+        env:
+          BACKTEST_PERIOD: "6y"
+          MIN_HISTORY: "220"
+          MIN_TRAIN: "2000"
+          VALIDATION_FRACTION: "0.20"
+          OOS_FRACTION: "0.20"
+          COST_BPS: "10"
+          SLIPPAGE_BPS: "5"
+        run: |
+          echo "=============================================="
+          echo "V6.3.17 CHRONOLOGICAL WALK-FORWARD BACKTEST"
+          echo "=============================================="
+
+          python backtest_v6_3_17.py
+
+      # ======================================================
+      # SHOW AUDIT FILES
+      # ======================================================
+
+      - name: Display audit files
+        if: always()
+        run: |
+          echo "=============================================="
+          echo "V6.3.17 AUDIT FILES"
+          echo "=============================================="
+
+          find audit \
+            -maxdepth 1 \
+            -type f \
+            -print \
+            | sort || true
+
+      # ======================================================
+      # UPLOAD RESULTS
+      # ======================================================
+
+      - name: Upload V6.3.17 backtest results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: v6-3-17-backtest-results-${{ github.run_number }}
+          path: audit/**
+          if-no-files-found: warn
+          retention-days: 90
