@@ -1,0 +1,72 @@
+name: V6.3.9 Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+
+  backtest:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify files
+        run: |
+          test -f backtest_v6_3_9.py
+          test -f requirements.txt
+
+      - name: Validate backtest syntax
+        run: |
+          python -m py_compile backtest_v6_3_9.py
+
+      - name: Run V6.3.9 walk-forward backtest
+        env:
+          BACKTEST_START: "2023-01-01"
+        run: |
+          python backtest_v6_3_9.py
+
+      - name: Upload V6.3.9 backtest results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v6-3-9-backtest-results
+          path: audit/
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Commit backtest audit
+        if: success()
+        run: |
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add audit/ || true
+
+          if git diff --cached --quiet; then
+            echo "No new audit files to commit."
+          else
+            git commit -m "Add V6.3.9 backtest results"
+            git push
+          fi
