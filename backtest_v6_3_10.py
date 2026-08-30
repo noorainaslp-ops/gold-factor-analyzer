@@ -1,1338 +1,53 @@
 """
-GOLD FACTOR ANALYZER
-MARKET ENGINE V6.3.10
+V6.3.10 WALK-FORWARD BACKTEST
 
-Major improvements over V6.3.9:
-1. Positive, volatility-aware stop-loss calculation.
-2. Genuine RR1/RR2 calculations.
-3. Regime is a weighting factor, not a hard rejection.
-4. Conservative probability calibration.
-5. Explicit liquidity/volume filtering.
-6. Position sizing based on actual stop distance.
-7. Empty GitHub environment variables are handled safely.
-8. Weekend / closed-market protection.
-9. Telegram failure cannot crash the workflow.
-10. No negative stop-loss values.
+Important:
+- Signal is generated using information available at signal close.
+- Entry occurs at NEXT trading day's OPEN.
+- Slippage is applied.
+- Round-trip costs are applied.
+- Stop/target are checked using future OHLC.
+- Probability calibration is updated only AFTER the future outcome.
+- This prevents future-label leakage into earlier predictions.
 """
 
 import os
-import math
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import requests
+
+from market_engine_v6_3_10 import (
+    UNIVERSE,
+    add_features,
+    calculate_raw_probability,
+    calculate_expected_returns,
+    calculate_risk_levels,
+    SLIPPAGE_BPS,
+    ROUND_TRIP_COST_BPS,
+)
 
 
 VERSION = "V6.3.10"
 
-IST = timezone(timedelta(hours=5, minutes=30))
+MIN_HISTORY = 220
 
-
-# ============================================================
-# SAFE ENVIRONMENT VARIABLE FUNCTIONS
-# ============================================================
-
-def env_float(name, default):
-    value = os.getenv(name, "")
-    try:
-        if value is None or str(value).strip() == "":
-            return float(default)
-        return float(value)
-    except (ValueError, TypeError):
-        return float(default)
-
-
-def env_int(name, default):
-    value = os.getenv(name, "")
-    try:
-        if value is None or str(value).strip() == "":
-            return int(default)
-        return int(value)
-    except (ValueError, TypeError):
-        return int(default)
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-CAPITAL = env_float("ALERT_CAPITAL", 100000)
-
-MAX_RISK_PCT = env_float(
-    "MAX_RISK_PCT",
-    1.0
-)
-
-MAX_POSITION_PCT = env_float(
-    "MAX_POSITION_PCT",
-    20.0
-)
-
-SLIPPAGE_BPS = env_float(
-    "SLIPPAGE_BPS",
-    8.0
-)
-
-ROUND_TRIP_COST_BPS = env_float(
-    "ROUND_TRIP_COST_BPS",
-    12.0
-)
-
-TOP_N = env_int(
-    "TOP_N",
+HORIZONS = (
+    1,
+    3,
     5
 )
 
 
-TELEGRAM_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    ""
-).strip()
-
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID",
-    ""
-).strip()
-
-
 # ============================================================
-# STOCK UNIVERSE
-# ============================================================
-
-UNIVERSE = [
-
-    "RELIANCE.NS",
-    "HDFCBANK.NS",
-    "ICICIBANK.NS",
-    "SBIN.NS",
-    "AXISBANK.NS",
-    "KOTAKBANK.NS",
-    "INDUSINDBK.NS",
-    "BAJFINANCE.NS",
-    "BAJAJFINSV.NS",
-    "SHRIRAMFIN.NS",
-
-    "LT.NS",
-    "M&M.NS",
-    "TATAMOTORS.NS",
-    "EICHERMOT.NS",
-    "MARUTI.NS",
-    "HEROMOTOCO.NS",
-
-    "TITAN.NS",
-    "ASIANPAINT.NS",
-    "HINDUNILVR.NS",
-    "ITC.NS",
-    "NESTLEIND.NS",
-
-    "SUNPHARMA.NS",
-    "DRREDDY.NS",
-    "CIPLA.NS",
-    "DIVISLAB.NS",
-
-    "TCS.NS",
-    "INFY.NS",
-    "HCLTECH.NS",
-    "WIPRO.NS",
-    "TECHM.NS",
-
-    "BHARTIARTL.NS",
-    "NTPC.NS",
-    "POWERGRID.NS",
-    "ONGC.NS",
-    "BPCL.NS",
-    "COALINDIA.NS",
-
-    "ADANIENT.NS",
-    "ADANIPORTS.NS",
-
-    "BEL.NS",
-    "HAL.NS",
-    "BHEL.NS",
-
-    "TRENT.NS",
-    "PIDILITIND.NS",
-    "SIEMENS.NS",
-    "ABB.NS",
-    "GRASIM.NS",
-    "ULTRACEMCO.NS",
-
-    "JSWSTEEL.NS",
-    "TATASTEEL.NS",
-    "HINDALCO.NS",
-
-    "IOC.NS",
-    "VEDL.NS",
-
-    "DLF.NS",
-    "LODHA.NS",
-    "INDIGO.NS",
-
-    "ZOMATO.NS",
-    "NAUKRI.NS",
-    "COFORGE.NS",
-
-    "JIOFIN.NS",
-    "IRFC.NS",
-    "IREDA.NS",
-
-    "POLYCAB.NS",
-]
-
-
-# ============================================================
-# PRIOR CALIBRATION
-# ============================================================
-
-# These are deliberately conservative.
-#
-# The V6.3.9 backtest showed:
-#
-# <40%     actual ~42.6%
-# 40-45%   actual ~46.5%
-# 45-50%   actual ~49.9%
-# 50-55%   actual ~51.8%
-# 55-60%   actual ~55.6%
-# 60-65%   actual ~58.0%
-# 65-70%   actual ~59.3%
-#
-# We shrink the empirical values toward 50%.
-#
-# This prevents the engine from claiming unrealistic probabilities.
-
-CAL_X = np.array([
-    0.32,
-    0.42,
-    0.47,
-    0.52,
-    0.57,
-    0.62,
-    0.67,
-    0.72,
-    0.80
-])
-
-CAL_Y = np.array([
-    0.43,
-    0.46,
-    0.49,
-    0.51,
-    0.54,
-    0.57,
-    0.59,
-    0.61,
-    0.62
-])
-
-
-def calibrated_probability(raw_probability):
-    """
-    Conservative calibration.
-
-    Never allows the engine to present a very high raw probability
-    as certainty.
-    """
-
-    raw_probability = float(
-        np.clip(
-            raw_probability,
-            0.20,
-            0.90
-        )
-    )
-
-    empirical = float(
-        np.interp(
-            raw_probability,
-            CAL_X,
-            CAL_Y
-        )
-    )
-
-    calibrated = (
-        0.50
-        + 0.92 * (empirical - 0.50)
-    )
-
-    return float(
-        np.clip(
-            calibrated,
-            0.35,
-            0.65
-        )
-    )
-
-
-# ============================================================
-# RSI
-# ============================================================
-
-def calculate_rsi(series, period=14):
-
-    delta = series.diff()
-
-    gains = delta.clip(
-        lower=0
-    )
-
-    losses = -delta.clip(
-        upper=0
-    )
-
-    avg_gain = gains.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
-
-    avg_loss = losses.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(
-        0,
-        np.nan
-    )
-
-    return 100 - (
-        100 / (1 + rs)
-    )
-
-
-# ============================================================
-# ATR
-# ============================================================
-
-def calculate_atr(df, period=14):
-
-    previous_close = df["Close"].shift(1)
-
-    true_range = pd.concat(
-        [
-            df["High"] - df["Low"],
-
-            (
-                df["High"]
-                - previous_close
-            ).abs(),
-
-            (
-                df["Low"]
-                - previous_close
-            ).abs(),
-        ],
-        axis=1
-    ).max(axis=1)
-
-    return true_range.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
-
-
-# ============================================================
-# FEATURES
-# ============================================================
-
-def add_features(df):
-
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    x = df.copy()
-
-    if isinstance(
-        x.columns,
-        pd.MultiIndex
-    ):
-
-        flattened = []
-
-        for column in x.columns:
-
-            if isinstance(
-                column,
-                tuple
-            ):
-
-                if column[0] in [
-                    "Open",
-                    "High",
-                    "Low",
-                    "Close",
-                    "Volume"
-                ]:
-
-                    flattened.append(
-                        column[0]
-                    )
-
-                else:
-
-                    flattened.append(
-                        column[-1]
-                    )
-
-            else:
-
-                flattened.append(
-                    column
-                )
-
-        x.columns = flattened
-
-    required = [
-        "Open",
-        "High",
-        "Low",
-        "Close",
-        "Volume"
-    ]
-
-    for column in required:
-
-        if column not in x.columns:
-            return pd.DataFrame()
-
-    x = x[
-        required
-    ].apply(
-        pd.to_numeric,
-        errors="coerce"
-    )
-
-    x = x.dropna(
-        subset=["Close"]
-    )
-
-    # --------------------------------------------------------
-    # RETURNS
-    # --------------------------------------------------------
-
-    x["ret1"] = (
-        x["Close"].pct_change()
-    )
-
-    x["ret3"] = (
-        x["Close"].pct_change(3)
-    )
-
-    x["ret5"] = (
-        x["Close"].pct_change(5)
-    )
-
-    x["ret20"] = (
-        x["Close"].pct_change(20)
-    )
-
-    # --------------------------------------------------------
-    # MOVING AVERAGES
-    # --------------------------------------------------------
-
-    x["sma20"] = (
-        x["Close"]
-        .rolling(
-            20,
-            min_periods=20
-        )
-        .mean()
-    )
-
-    x["sma50"] = (
-        x["Close"]
-        .rolling(
-            50,
-            min_periods=50
-        )
-        .mean()
-    )
-
-    x["sma200"] = (
-        x["Close"]
-        .rolling(
-            200,
-            min_periods=200
-        )
-        .mean()
-    )
-
-    # --------------------------------------------------------
-    # MOMENTUM / RSI
-    # --------------------------------------------------------
-
-    x["rsi"] = calculate_rsi(
-        x["Close"]
-    )
-
-    x["atr"] = calculate_atr(
-        x
-    )
-
-    x["atr_pct"] = (
-        x["atr"]
-        / x["Close"]
-    )
-
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
-
-    x["vol_ratio"] = (
-        x["Volume"]
-        /
-        x["Volume"]
-        .rolling(
-            20,
-            min_periods=10
-        )
-        .median()
-    )
-
-    # --------------------------------------------------------
-    # VOLATILITY
-    # --------------------------------------------------------
-
-    x["volatility20"] = (
-        x["ret1"]
-        .rolling(
-            20,
-            min_periods=20
-        )
-        .std()
-        * np.sqrt(252)
-    )
-
-    # --------------------------------------------------------
-    # TREND
-    # --------------------------------------------------------
-
-    x["trend20"] = (
-        x["Close"]
-        / x["sma20"]
-        - 1
-    )
-
-    x["trend50"] = (
-        x["Close"]
-        / x["sma50"]
-        - 1
-    )
-
-    x["trend200"] = (
-        x["Close"]
-        / x["sma200"]
-        - 1
-    )
-
-    # --------------------------------------------------------
-    # MOMENTUM SCORE
-    # --------------------------------------------------------
-
-    x["mom_score"] = (
-        0.45 * x["ret5"].fillna(0)
-        +
-        0.35 * x["ret20"].fillna(0)
-        +
-        0.20 * x["ret3"].fillna(0)
-    )
-
-    # --------------------------------------------------------
-    # QUALITY SCORE
-    # --------------------------------------------------------
-
-    x["quality"] = (
-
-        0.35
-        * (
-            x["trend20"] > 0
-        ).astype(float)
-
-        +
-
-        0.35
-        * (
-            x["trend50"] > 0
-        ).astype(float)
-
-        +
-
-        0.30
-        * (
-            x["trend200"] > 0
-        ).astype(float)
-    )
-
-    return x
-
-
-# ============================================================
-# MARKET REGIME
-# ============================================================
-
-def determine_market_regime(index_df):
-
-    features = add_features(
-        index_df
-    )
-
-    if features.empty:
-
-        return (
-            "UNKNOWN",
-            np.nan,
-            np.nan,
-            "Index data unavailable"
-        )
-
-    row = features.iloc[-1]
-
-    nifty = float(
-        row["Close"]
-    )
-
-    sma50 = float(
-        row["sma50"]
-    ) if pd.notna(
-        row["sma50"]
-    ) else np.nan
-
-    if pd.isna(sma50):
-
-        return (
-            "UNKNOWN",
-            nifty,
-            sma50,
-            "SMA50 unavailable"
-        )
-
-    slope = (
-        features["sma50"]
-        .diff(5)
-        .iloc[-1]
-    )
-
-    distance = (
-        nifty / sma50
-        - 1
-    )
-
-    if (
-        distance > 0.008
-        and pd.notna(slope)
-        and slope > 0
-    ):
-
-        return (
-            "FAVORABLE",
-            nifty,
-            sma50,
-            "Nifty above SMA50 with rising SMA50"
-        )
-
-    if (
-        distance < -0.008
-        and pd.notna(slope)
-        and slope < 0
-    ):
-
-        return (
-            "UNFAVORABLE",
-            nifty,
-            sma50,
-            "Nifty below SMA50 with falling SMA50"
-        )
-
-    return (
-        "MIXED",
-        nifty,
-        sma50,
-        "Nifty/SMA50 signals mixed"
-    )
-
-
-# ============================================================
-# RAW PROBABILITY MODEL
-# ============================================================
-
-def calculate_raw_probability(
-    row,
-    regime
-):
-
-    rsi_value = float(
-        row["rsi"]
-    )
-
-    rsi_component = np.clip(
-        (rsi_value - 50) / 25,
-        -1,
-        1
-    )
-
-    trend_component = np.clip(
-        (
-            row["trend20"] * 40
-            +
-            row["trend50"] * 30
-            +
-            row["trend200"] * 15
-        ),
-        -1,
-        1
-    )
-
-    momentum_component = np.clip(
-        row["mom_score"] * 30,
-        -1,
-        1
-    )
-
-    volume_component = np.clip(
-        (
-            row["vol_ratio"] - 1
-        ) / 1.5,
-        -1,
-        1
-    )
-
-    volatility_penalty = np.clip(
-        (
-            row["atr_pct"]
-            - 0.025
-        ) / 0.025,
-        -1,
-        1
-    )
-
-    regime_component = {
-        "FAVORABLE": 0.55,
-        "MIXED": 0.00,
-        "UNFAVORABLE": -0.35,
-    }.get(
-        regime,
-        0
-    )
-
-    score = (
-
-        0.34
-        * trend_component
-
-        +
-
-        0.28
-        * momentum_component
-
-        +
-
-        0.12
-        * rsi_component
-
-        +
-
-        0.10
-        * volume_component
-
-        -
-
-        0.06
-        * volatility_penalty
-
-        +
-
-        0.10
-        * regime_component
-    )
-
-    raw = (
-        0.50
-        +
-        0.24 * score
-    )
-
-    # Avoid treating extreme RSI as automatically bullish.
-    if rsi_value > 72:
-
-        raw -= min(
-            0.05,
-            (
-                rsi_value - 72
-            ) * 0.004
-        )
-
-    return float(
-        np.clip(
-            raw,
-            0.25,
-            0.78
-        )
-    )
-
-
-# ============================================================
-# EXPECTED RETURNS
-# ============================================================
-
-def calculate_expected_returns(
-    row,
-    regime
-):
-
-    trend = float(
-        row["trend20"]
-        if pd.notna(
-            row["trend20"]
-        )
-        else 0
-    )
-
-    momentum = float(
-        row["mom_score"]
-        if pd.notna(
-            row["mom_score"]
-        )
-        else 0
-    )
-
-    rsi_value = float(
-        row["rsi"]
-        if pd.notna(
-            row["rsi"]
-        )
-        else 50
-    )
-
-    rsi_bias = np.clip(
-        (
-            rsi_value - 50
-        ) / 100,
-        -0.15,
-        0.15
-    )
-
-    regime_bias = {
-
-        "FAVORABLE": 0.0025,
-
-        "MIXED": 0.0,
-
-        "UNFAVORABLE": -0.0015,
-
-    }.get(
-        regime,
-        0
-    )
-
-    base = (
-
-        0.010 * trend
-
-        +
-
-        0.018 * momentum
-
-        +
-
-        0.006 * rsi_bias
-
-        +
-
-        regime_bias
-    )
-
-    er1 = np.clip(
-        base * 0.42,
-        -0.02,
-        0.02
-    )
-
-    er3 = np.clip(
-        base * 1.00,
-        -0.05,
-        0.05
-    )
-
-    er5 = np.clip(
-        base * 1.55,
-        -0.08,
-        0.08
-    )
-
-    return (
-        float(er1),
-        float(er3),
-        float(er5)
-    )
-
-
-# ============================================================
-# REAL RISK / REWARD
-# ============================================================
-
-def calculate_risk_levels(row):
-
-    price = float(
-        row["Close"]
-    )
-
-    atr_value = float(
-        row["atr"]
-        if pd.notna(
-            row["atr"]
-        )
-        else price * 0.02
-    )
-
-    # --------------------------------------------------------
-    # STOP DISTANCE
-    # --------------------------------------------------------
-
-    stop_distance = max(
-        1.15 * atr_value,
-        price * 0.008
-    )
-
-    stop_distance = np.clip(
-        stop_distance,
-        price * 0.008,
-        price * 0.035
-    )
-
-    # --------------------------------------------------------
-    # STOP
-    # --------------------------------------------------------
-
-    stop_loss = (
-        price
-        - stop_distance
-    )
-
-    # Safety: never negative.
-    stop_loss = max(
-        stop_loss,
-        price * 0.50
-    )
-
-    # --------------------------------------------------------
-    # TARGETS
-    # --------------------------------------------------------
-
-    target1 = (
-        price
-        +
-        max(
-            0.85 * atr_value,
-            price * 0.008
-        )
-    )
-
-    target2 = (
-        price
-        +
-        max(
-            1.60 * atr_value,
-            price * 0.014
-        )
-    )
-
-    risk = (
-        price
-        - stop_loss
-    )
-
-    if risk <= 0:
-
-        return (
-            stop_loss,
-            target1,
-            target2,
-            np.nan,
-            np.nan,
-            np.nan
-        )
-
-    rr1 = (
-        target1 - price
-    ) / risk
-
-    rr2 = (
-        target2 - price
-    ) / risk
-
-    return (
-        float(stop_loss),
-        float(target1),
-        float(target2),
-        float(rr1),
-        float(rr2),
-        float(risk)
-    )
-
-
-# ============================================================
-# CANDIDATE CLASSIFICATION
-# ============================================================
-
-def evaluate_candidate(
-    row,
-    regime
-):
-
-    raw_probability = (
-        calculate_raw_probability(
-            row,
-            regime
-        )
-    )
-
-    probability = (
-        calibrated_probability(
-            raw_probability
-        )
-    )
-
-    er1, er3, er5 = (
-        calculate_expected_returns(
-            row,
-            regime
-        )
-    )
-
-    (
-        stop,
-        target1,
-        target2,
-        rr1,
-        rr2,
-        risk
-    ) = calculate_risk_levels(
-        row
-    )
-
-    volume_ok = (
-        pd.notna(
-            row["vol_ratio"]
-        )
-        and
-        0.75
-        <=
-        float(
-            row["vol_ratio"]
-        )
-        <=
-        3.0
-    )
-
-    trend_ok = (
-        float(
-            row["trend20"]
-        ) > -0.005
-        and
-        float(
-            row["trend50"]
-        ) > -0.010
-    )
-
-    rsi_ok = (
-        42
-        <=
-        float(
-            row["rsi"]
-        )
-        <=
-        70
-    )
-
-    quality_ok = (
-        float(
-            row["quality"]
-        ) >= 0.33
-    )
-
-    regime_ok = (
-        regime
-        in
-        {
-            "FAVORABLE",
-            "MIXED",
-            "UNFAVORABLE"
-        }
-    )
-
-    rr1_ok = (
-        pd.notna(rr1)
-        and
-        rr1 >= 1.05
-    )
-
-    rr2_ok = (
-        pd.notna(rr2)
-        and
-        rr2 >= 1.45
-    )
-
-    p3_ok = (
-        probability >= 0.56
-    )
-
-    p5_ok = (
-        probability >= 0.58
-    )
-
-    er3_ok = (
-        er3 >= 0.0025
-    )
-
-    er5_ok = (
-        er5 >= 0.0040
-    )
-
-    checks = {
-
-        "p3": p3_ok,
-        "p5": p5_ok,
-        "er3": er3_ok,
-        "er5": er5_ok,
-
-        "rr1": rr1_ok,
-        "rr2": rr2_ok,
-
-        "quality": quality_ok,
-        "trend": trend_ok,
-        "rsi": rsi_ok,
-        "volume": volume_ok,
-        "regime": regime_ok,
-    }
-
-    failures = [
-        name
-        for name, passed
-        in checks.items()
-        if not passed
-    ]
-
-    # --------------------------------------------------------
-    # TRADE
-    # --------------------------------------------------------
-
-    if all(
-        [
-            p3_ok,
-            p5_ok,
-            er3_ok,
-            er5_ok,
-            rr1_ok,
-            rr2_ok,
-            quality_ok,
-            trend_ok,
-            rsi_ok,
-            volume_ok,
-        ]
-    ):
-
-        action = "TRADE"
-
-    # --------------------------------------------------------
-    # WATCH
-    # --------------------------------------------------------
-
-    elif (
-        probability >= 0.54
-        and
-        er3 > 0
-        and
-        er5 > 0
-        and
-        rr2 >= 1.15
-        and
-        trend_ok
-    ):
-
-        action = "WATCH"
-
-    else:
-
-        action = "WAIT"
-
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
-
-    score = (
-
-        100
-        * (
-            probability
-            - 0.50
-        )
-
-        +
-
-        18 * er3
-
-        +
-
-        10 * er5
-
-        +
-
-        4 * (
-            rr2 - 1
-        )
-
-        +
-
-        2 * (
-            float(
-                row["vol_ratio"]
-            )
-            - 1
-        )
-
-        +
-
-        3 * (
-            float(
-                row["quality"]
-            )
-            - 0.50
-        )
-    )
-
-    return {
-
-        "raw_probability":
-            raw_probability,
-
-        "probability":
-            probability,
-
-        "er1":
-            er1,
-
-        "er3":
-            er3,
-
-        "er5":
-            er5,
-
-        "stop":
-            stop,
-
-        "target1":
-            target1,
-
-        "target2":
-            target2,
-
-        "rr1":
-            rr1,
-
-        "rr2":
-            rr2,
-
-        "risk":
-            risk,
-
-        "action":
-            action,
-
-        "score":
-            float(score),
-
-        "rsi":
-            float(
-                row["rsi"]
-            ),
-
-        "volume":
-            float(
-                row["vol_ratio"]
-            ),
-
-        "failures":
-            failures,
-    }
-
-
-# ============================================================
-# POSITION SIZING
-# ============================================================
-
-def calculate_position_size(
-    price,
-    stop
-):
-
-    if (
-        not np.isfinite(price)
-        or
-        not np.isfinite(stop)
-        or
-        price <= 0
-        or
-        stop <= 0
-        or
-        stop >= price
-    ):
-
-        return 0
-
-    risk_budget = (
-        CAPITAL
-        *
-        MAX_RISK_PCT
-        /
-        100
-    )
-
-    risk_per_share = (
-        price
-        - stop
-    )
-
-    shares_by_risk = math.floor(
-        risk_budget
-        /
-        risk_per_share
-    )
-
-    position_budget = (
-        CAPITAL
-        *
-        MAX_POSITION_PCT
-        /
-        100
-    )
-
-    shares_by_position = math.floor(
-        position_budget
-        /
-        price
-    )
-
-    return max(
-        0,
-        min(
-            shares_by_risk,
-            shares_by_position
-        )
-    )
-
-
-# ============================================================
-# DOWNLOAD DATA
+# DATA
 # ============================================================
 
 def download_data(
     ticker,
-    period="2y"
+    period="6y"
 ):
 
     try:
@@ -1359,7 +74,7 @@ def download_data(
             pd.MultiIndex
         ):
 
-            new_columns = []
+            columns = []
 
             for column in df.columns:
 
@@ -1376,23 +91,23 @@ def download_data(
                         "Volume"
                     ]:
 
-                        new_columns.append(
+                        columns.append(
                             column[0]
                         )
 
                     else:
 
-                        new_columns.append(
+                        columns.append(
                             column[-1]
                         )
 
                 else:
 
-                    new_columns.append(
+                    columns.append(
                         column
                     )
 
-            df.columns = new_columns
+            df.columns = columns
 
         required = [
             "Open",
@@ -1421,575 +136,403 @@ def download_data(
     except Exception as error:
 
         print(
-            f"{ticker}: data error: {error}"
+            f"{ticker}: {error}"
         )
 
         return pd.DataFrame()
 
 
 # ============================================================
-# TELEGRAM
+# REGIME HISTORY
 # ============================================================
 
-def send_telegram(message):
+def build_regime_history(
+    index_features
+):
 
-    if (
-        not TELEGRAM_TOKEN
-        or
-        not TELEGRAM_CHAT_ID
+    regimes = {}
+
+    for date, row in (
+        index_features.iterrows()
     ):
 
-        print(
-            "Telegram credentials not configured."
+        if pd.isna(
+            row["sma50"]
+        ):
+
+            regimes[
+                pd.Timestamp(
+                    date
+                ).date()
+            ] = "UNKNOWN"
+
+            continue
+
+        history = (
+            index_features
+            .loc[:date]
         )
 
-        return False
+        if len(history) > 6:
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
-    )
+            slope = (
+                history["sma50"]
+                .diff(5)
+                .iloc[-1]
+            )
 
-    payload = {
+        else:
 
-        "chat_id":
-            TELEGRAM_CHAT_ID,
+            slope = np.nan
 
-        "text":
-            message,
-
-        "disable_web_page_preview":
-            True,
-    }
-
-    try:
-
-        response = requests.post(
-            url,
-            json=payload,
-            timeout=20
-        )
-
-        response.raise_for_status()
-
-        return True
-
-    except Exception as error:
-
-        print(
-            f"Telegram error: {error}"
-        )
-
-        return False
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    now = datetime.now(
-        IST
-    )
-
-    print(
-        f"MARKET ALERT {VERSION}"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        f"Configured capital: "
-        f"₹{CAPITAL:,.2f}"
-    )
-
-    print(
-        f"Maximum risk/trade: "
-        f"{MAX_RISK_PCT:.2f}%"
-    )
-
-    # --------------------------------------------------------
-    # INDEX
-    # --------------------------------------------------------
-
-    nifty_df = download_data(
-        "^NSEI"
-    )
-
-    (
-        regime,
-        nifty,
-        sma50,
-        regime_reason
-    ) = determine_market_regime(
-        nifty_df
-    )
-
-    # --------------------------------------------------------
-    # MARKET STATUS
-    # --------------------------------------------------------
-
-    market_open = (
-        now.weekday() < 5
-    )
-
-    if market_open:
-
-        market_open = (
-            9 <= now.hour < 16
-        )
-
-    # --------------------------------------------------------
-    # STOCK ANALYSIS
-    # --------------------------------------------------------
-
-    results = []
-
-    print(
-        f"Downloading data for "
-        f"{len(UNIVERSE)} instruments..."
-    )
-
-    for ticker in UNIVERSE:
-
-        df = download_data(
-            ticker
-        )
-
-        features = add_features(
-            df
+        distance = (
+            row["Close"]
+            /
+            row["sma50"]
+            - 1
         )
 
         if (
-            features.empty
-            or
-            len(features) < 220
+            distance > 0.008
+            and
+            pd.notna(slope)
+            and
+            slope > 0
         ):
 
-            continue
+            regime = "FAVORABLE"
 
-        row = features.iloc[-1]
-
-        required_features = [
-            "atr",
-            "rsi",
-            "sma50",
-            "vol_ratio",
-            "trend20",
-            "trend50",
-        ]
-
-        if any(
-            pd.isna(
-                row[c]
-            )
-            for c in required_features
+        elif (
+            distance < -0.008
+            and
+            pd.notna(slope)
+            and
+            slope < 0
         ):
 
-            continue
+            regime = "UNFAVORABLE"
 
-        try:
+        else:
 
-            evaluation = (
-                evaluate_candidate(
-                    row,
-                    regime
-                )
-            )
+            regime = "MIXED"
 
-            price = float(
-                row["Close"]
-            )
+        regimes[
+            pd.Timestamp(
+                date
+            ).date()
+        ] = regime
 
-            shares = 0
+    return regimes
 
-            if (
-                evaluation["action"]
-                == "TRADE"
-            ):
 
-                shares = (
-                    calculate_position_size(
-                        price,
-                        evaluation["stop"]
-                    )
-                )
+# ============================================================
+# ONLINE CALIBRATOR
+# ============================================================
 
-            evaluation[
-                "ticker"
-            ] = ticker.replace(
-                ".NS",
-                ""
-            )
+class OnlineCalibrator:
 
-            evaluation[
-                "price"
-            ] = price
+    """
+    Calibration uses only outcomes that were already known.
 
-            evaluation[
-                "shares"
-            ] = shares
+    A signal NEVER gets to use its own future outcome
+    to determine its probability.
+    """
 
-            evaluation[
-                "capital"
-            ] = (
-                shares
-                * price
-            )
+    def __init__(self):
 
-            evaluation[
-                "max_loss"
-            ] = (
-                shares
-                *
-                evaluation["risk"]
-            )
+        self.edges = np.array([
+            0.00,
+            0.40,
+            0.45,
+            0.50,
+            0.55,
+            0.60,
+            0.65,
+            0.70,
+            0.75,
+            1.01
+        ])
 
-            results.append(
-                evaluation
-            )
-
-        except Exception as error:
-
-            print(
-                f"{ticker}: "
-                f"evaluation error: "
-                f"{error}"
-            )
-
-    # --------------------------------------------------------
-    # SORT
-    # --------------------------------------------------------
-
-    results.sort(
-        key=lambda item: (
-            item["action"] == "TRADE",
-            item["score"]
-        ),
-        reverse=True
-    )
-
-    trades = [
-        x for x in results
-        if x["action"] == "TRADE"
-    ][:TOP_N]
-
-    watches = [
-        x for x in results
-        if x["action"] == "WATCH"
-    ][:TOP_N]
-
-    # ========================================================
-    # ALERT
-    # ========================================================
-
-    lines = []
-
-    lines.append(
-        f"MULTI-FACTOR MARKET ALERT "
-        f"{VERSION}"
-    )
-
-    lines.append(
-        now.strftime(
-            "%d %b %Y, %H:%M IST"
-        )
-    )
-
-    lines.append("")
-
-    lines.append(
-        "MARKET STATUS: "
-        +
-        (
-            "OPEN / SESSION"
-            if market_open
-            else
-            "WEEKEND / NON-TRADING DAY"
-        )
-    )
-
-    lines.append(
-        f"MARKET REGIME: {regime}"
-    )
-
-    if pd.notna(nifty):
-
-        lines.append(
-            f"NIFTY: ₹{nifty:,.2f}"
+        self.observations = np.zeros(
+            9,
+            dtype=float
         )
 
-    else:
-
-        lines.append(
-            "NIFTY: N/A"
+        self.wins = np.zeros(
+            9,
+            dtype=float
         )
 
-    if pd.notna(sma50):
-
-        lines.append(
-            f"SMA50: ₹{sma50:,.2f}"
-        )
-
-    else:
-
-        lines.append(
-            "SMA50: N/A"
-        )
-
-    lines.append(
-        f"REGIME REASON: "
-        f"{regime_reason}"
-    )
-
-    lines.append("")
-
-    lines.append(
-        "--- TOP SHORT-TERM "
-        "TRADE SETUPS (1–5 SESSIONS) ---"
-    )
-
-    if not market_open:
-
-        lines.append(
-            "MARKET IS CLOSED."
-        )
-
-        lines.append(
-            "No new long position "
-            "should be initiated today."
-        )
-
-    if (
-        market_open
-        and
-        trades
+    def bucket(
+        self,
+        probability
     ):
 
-        for number, item in enumerate(
-            trades,
-            start=1
-        ):
-
-            lines.append("")
-
-            lines.append(
-                f"{number}. "
-                f"{item['ticker']} — TRADE"
+        return int(
+            np.clip(
+                np.digitize(
+                    [probability],
+                    self.edges,
+                    right=False
+                )[0] - 1,
+                0,
+                8
             )
-
-            lines.append(
-                f"Price: "
-                f"₹{item['price']:,.2f}"
-            )
-
-            lines.append(
-                f"Calibrated P(UP): "
-                f"{item['probability']*100:.1f}%"
-            )
-
-            lines.append(
-                f"Expected return "
-                f"3D / 5D: "
-                f"{item['er3']*100:.2f}% / "
-                f"{item['er5']*100:.2f}%"
-            )
-
-            lines.append(
-                f"RSI: "
-                f"{item['rsi']:.1f}"
-                f" | Volume: "
-                f"{item['volume']:.2f}x"
-            )
-
-            lines.append(
-                f"Entry zone: "
-                f"₹{item['price']*0.998:,.2f}"
-                f" – "
-                f"₹{item['price']*1.002:,.2f}"
-            )
-
-            lines.append(
-                f"Stop Loss: "
-                f"₹{item['stop']:,.2f}"
-            )
-
-            lines.append(
-                f"Target 1: "
-                f"₹{item['target1']:,.2f}"
-            )
-
-            lines.append(
-                f"Target 2: "
-                f"₹{item['target2']:,.2f}"
-            )
-
-            lines.append(
-                f"Risk/Reward: "
-                f"{item['rr1']:.2f} / "
-                f"{item['rr2']:.2f}"
-            )
-
-            lines.append(
-                f"Suggested position: "
-                f"{item['shares']} shares "
-                f"≈ ₹{item['capital']:,.0f}"
-            )
-
-            lines.append(
-                f"Maximum planned loss: "
-                f"₹{item['max_loss']:,.0f}"
-            )
-
-            lines.append(
-                "Action: BUY / TRADE only "
-                "if price remains inside "
-                "the entry zone."
-            )
-
-    else:
-
-        lines.append(
-            "NO VALID LONG TRADE TODAY"
         )
 
-        lines.append(
-            "No candidate currently "
-            "satisfies the full V6.3.10 "
-            "probability, expectancy, "
-            "risk/reward, liquidity and "
-            "technical filters."
+    def transform(
+        self,
+        probability
+    ):
+
+        bucket = self.bucket(
+            probability
         )
 
-    # ========================================================
-    # WATCHLIST
-    # ========================================================
+        n = (
+            self.observations[
+                bucket
+            ]
+        )
 
-    lines.append("")
+        wins = (
+            self.wins[
+                bucket
+            ]
+        )
 
-    lines.append(
-        "--- BEST WATCHLIST SETUPS ---"
-    )
+        # Small-sample protection.
+        if n < 25:
 
-    if watches:
-
-        for number, item in enumerate(
-            watches,
-            start=1
-        ):
-
-            lines.append("")
-
-            lines.append(
-                f"{number}. "
-                f"{item['ticker']} — WATCH"
-            )
-
-            lines.append(
-                f"Price: "
-                f"₹{item['price']:,.2f}"
-            )
-
-            lines.append(
-                f"P(UP): "
-                f"{item['probability']*100:.1f}%"
-            )
-
-            lines.append(
-                f"ER3 / ER5: "
-                f"{item['er3']*100:.2f}% / "
-                f"{item['er5']*100:.2f}%"
-            )
-
-            lines.append(
-                f"RR1 / RR2: "
-                f"{item['rr1']:.2f} / "
-                f"{item['rr2']:.2f}"
-            )
-
-            lines.append(
-                f"RSI: "
-                f"{item['rsi']:.1f}"
-                f" | Volume: "
-                f"{item['volume']:.2f}x"
-            )
-
-            if item["failures"]:
-
-                lines.append(
-                    "Failed filters: "
+            return float(
+                np.clip(
+                    0.50
                     +
-                    ",".join(
-                        item["failures"]
-                    )
+                    0.55
+                    * (
+                        probability
+                        - 0.50
+                    ),
+                    0.35,
+                    0.65
                 )
-
-            else:
-
-                lines.append(
-                    "Failed filters: none"
-                )
-
-            lines.append(
-                "Action: WATCH / WAIT"
             )
 
-    else:
-
-        lines.append(
-            "None."
+        empirical = (
+            wins
+            +
+            8 * probability
+        ) / (
+            n + 8
         )
 
-    # ========================================================
-    # SAFETY
-    # ========================================================
+        return float(
+            np.clip(
+                0.50
+                +
+                0.92
+                * (
+                    empirical
+                    - 0.50
+                ),
+                0.35,
+                0.70
+            )
+        )
 
-    lines.append("")
+    def update(
+        self,
+        probability,
+        outcome
+    ):
 
-    lines.append(
-        "--- MODEL SAFETY ---"
+        bucket = self.bucket(
+            probability
+        )
+
+        self.observations[
+            bucket
+        ] += 1
+
+        self.wins[
+            bucket
+        ] += float(
+            outcome
+        )
+
+
+# ============================================================
+# TRANSACTION COST
+# ============================================================
+
+def transaction_cost_fraction():
+
+    return (
+        2 * SLIPPAGE_BPS
+        +
+        ROUND_TRIP_COST_BPS
+    ) / 10000.0
+
+
+# ============================================================
+# REALISTIC TRADE TEST
+# ============================================================
+
+def simulate_trade(
+    df,
+    signal_index,
+    stop_loss,
+    target1,
+    horizon
+):
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # Entry is NEXT trading day's OPEN.
+    # --------------------------------------------------------
+
+    if (
+        signal_index + 1
+        >= len(df)
+    ):
+
+        return None
+
+    if (
+        signal_index + horizon
+        >= len(df)
+    ):
+
+        return None
+
+    entry = (
+        float(
+            df["Open"].iloc[
+                signal_index + 1
+            ]
+        )
+        *
+        (
+            1
+            +
+            SLIPPAGE_BPS
+            /
+            10000
+        )
     )
 
-    lines.append(
-        "P(UP) is a conservative "
-        "empirically calibrated estimate, "
-        "not a guaranteed probability "
-        "of profit."
+    exit_price = (
+        float(
+            df["Close"].iloc[
+                signal_index + horizon
+            ]
+        )
+        *
+        (
+            1
+            -
+            SLIPPAGE_BPS
+            /
+            10000
+        )
     )
 
-    lines.append(
-        "V6.3.10 uses positive, "
-        "volatility-aware stop losses "
-        "and explicit R/R calculations."
+    stop_hit = False
+    target_hit = False
+
+    # --------------------------------------------------------
+    # Check future sessions.
+    #
+    # Conservative rule:
+    # If both stop and target are touched in one candle,
+    # stop is assumed to have occurred first.
+    # --------------------------------------------------------
+
+    for future_index in range(
+
+        signal_index + 1,
+
+        min(
+            signal_index
+            + horizon
+            + 1,
+            len(df)
+        )
+
+    ):
+
+        low = float(
+            df["Low"].iloc[
+                future_index
+            ]
+        )
+
+        high = float(
+            df["High"].iloc[
+                future_index
+            ]
+        )
+
+        if low <= stop_loss:
+
+            stop_hit = True
+
+            exit_price = (
+                stop_loss
+                *
+                (
+                    1
+                    -
+                    SLIPPAGE_BPS
+                    /
+                    10000
+                )
+            )
+
+            break
+
+        if high >= target1:
+
+            target_hit = True
+
+            exit_price = (
+                target1
+                *
+                (
+                    1
+                    -
+                    SLIPPAGE_BPS
+                    /
+                    10000
+                )
+            )
+
+            break
+
+    net_return = (
+        (
+            exit_price
+            -
+            entry
+        )
+        /
+        entry
+        -
+        transaction_cost_fraction()
     )
 
-    lines.append(
-        "No negative stop-loss values "
-        "are permitted."
+    return (
+        float(net_return),
+        stop_hit,
+        target_hit
     )
 
-    lines.append(
-        f"Position sizing limits planned "
-        f"risk to {MAX_RISK_PCT:.2f}% "
-        f"of configured capital."
-    )
 
-    lines.append(
-        "Verify live price, liquidity, "
-        "corporate news, market status "
-        "and order execution before trading."
-    )
+# ============================================================
+# MAIN BACKTEST
+# ============================================================
 
-    alert = "\n".join(
-        lines
-    )
-
-    # ========================================================
-    # AUDIT
-    # ========================================================
+def main():
 
     Path(
         "audit"
@@ -1997,28 +540,890 @@ def main():
         exist_ok=True
     )
 
-    timestamp = now.strftime(
-        "%Y%m%d_%H%M%S"
+    print(
+        f"Starting {VERSION} "
+        "walk-forward backtest..."
     )
 
-    audit_file = (
+    # --------------------------------------------------------
+    # MARKET INDEX
+    # --------------------------------------------------------
+
+    index = download_data(
+        "^NSEI",
+        "6y"
+    )
+
+    if index.empty:
+
+        raise RuntimeError(
+            "Unable to download ^NSEI"
+        )
+
+    index_features = add_features(
+        index
+    )
+
+    regimes = build_regime_history(
+        index_features
+    )
+
+    calibrator = (
+        OnlineCalibrator()
+    )
+
+    observations = []
+
+    # ========================================================
+    # STOCK LOOP
+    # ========================================================
+
+    for number, ticker in enumerate(
+        UNIVERSE,
+        start=1
+    ):
+
+        print(
+            f"[{number}/{len(UNIVERSE)}] "
+            f"{ticker}"
+        )
+
+        df = download_data(
+            ticker,
+            "6y"
+        )
+
+        if (
+            df.empty
+            or
+            len(df) <
+            MIN_HISTORY + 10
+        ):
+
+            continue
+
+        features = add_features(
+            df
+        )
+
+        if features.empty:
+
+            continue
+
+        # ----------------------------------------------------
+        # SIGNAL DAYS
+        # ----------------------------------------------------
+
+        for i in range(
+            MIN_HISTORY,
+            len(features) - 6
+        ):
+
+            row = features.iloc[i]
+
+            date = (
+                pd.Timestamp(
+                    features.index[i]
+                ).date()
+            )
+
+            regime = regimes.get(
+                date,
+                "UNKNOWN"
+            )
+
+            if regime == "UNKNOWN":
+
+                continue
+
+            required = [
+                "atr",
+                "rsi",
+                "sma50",
+                "vol_ratio",
+                "trend20",
+                "trend50"
+            ]
+
+            if any(
+                pd.isna(
+                    row[column]
+                )
+                for column
+                in required
+            ):
+
+                continue
+
+            # ------------------------------------------------
+            # RAW MODEL
+            # ------------------------------------------------
+
+            raw_probability = (
+                calculate_raw_probability(
+                    row,
+                    regime
+                )
+            )
+
+            # ------------------------------------------------
+            # PAST-ONLY CALIBRATION
+            # ------------------------------------------------
+
+            probability = (
+                calibrator.transform(
+                    raw_probability
+                )
+            )
+
+            er1, er3, er5 = (
+                calculate_expected_returns(
+                    row,
+                    regime
+                )
+            )
+
+            (
+                stop_loss,
+                target1,
+                target2,
+                rr1,
+                rr2,
+                risk
+            ) = calculate_risk_levels(
+                row
+            )
+
+            # ------------------------------------------------
+            # FILTERS
+            # ------------------------------------------------
+
+            p3_ok = (
+                probability >= 0.56
+            )
+
+            p5_ok = (
+                probability >= 0.58
+            )
+
+            er3_ok = (
+                er3 >= 0.0025
+            )
+
+            er5_ok = (
+                er5 >= 0.0040
+            )
+
+            rr1_ok = (
+                pd.notna(rr1)
+                and
+                rr1 >= 1.05
+            )
+
+            rr2_ok = (
+                pd.notna(rr2)
+                and
+                rr2 >= 1.45
+            )
+
+            quality_ok = (
+                float(
+                    row["quality"]
+                ) >= 0.33
+            )
+
+            trend_ok = (
+                float(
+                    row["trend20"]
+                ) > -0.005
+                and
+                float(
+                    row["trend50"]
+                ) > -0.010
+            )
+
+            rsi_ok = (
+                42
+                <=
+                float(
+                    row["rsi"]
+                )
+                <=
+                70
+            )
+
+            volume_ok = (
+                0.75
+                <=
+                float(
+                    row["vol_ratio"]
+                )
+                <=
+                3.0
+            )
+
+            # Regime is deliberately NOT a hard filter.
+            regime_ok = True
+
+            # ------------------------------------------------
+            # CLASSIFICATION
+            # ------------------------------------------------
+
+            if all(
+                [
+                    p3_ok,
+                    p5_ok,
+                    er3_ok,
+                    er5_ok,
+                    rr1_ok,
+                    rr2_ok,
+                    quality_ok,
+                    trend_ok,
+                    rsi_ok,
+                    volume_ok
+                ]
+            ):
+
+                action = "TRADE"
+
+            elif (
+                probability >= 0.54
+                and
+                er3 > 0
+                and
+                er5 > 0
+                and
+                rr2 >= 1.15
+                and
+                trend_ok
+            ):
+
+                action = "WATCH"
+
+            else:
+
+                action = "WAIT"
+
+            # ------------------------------------------------
+            # FUTURE OUTCOME
+            #
+            # Use 5D result for updating calibration only AFTER
+            # the signal's future outcome is known.
+            # ------------------------------------------------
+
+            five_day = simulate_trade(
+                df,
+                i,
+                stop_loss,
+                target1,
+                5
+            )
+
+            if five_day is None:
+
+                continue
+
+            net5, stop_hit, target_hit = (
+                five_day
+            )
+
+            # ------------------------------------------------
+            # UPDATE CALIBRATOR AFTER OUTCOME
+            # ------------------------------------------------
+
+            outcome = (
+                1
+                if net5 > 0
+                else 0
+            )
+
+            calibrator.update(
+                raw_probability,
+                outcome
+            )
+
+            # ------------------------------------------------
+            # SIMPLE HORIZON RETURNS
+            #
+            # For clean comparison, these use next-open entry
+            # and exit at the future close, after costs.
+            # ------------------------------------------------
+
+            future_returns = {}
+
+            for horizon in (
+                1,
+                3,
+                5
+            ):
+
+                if (
+                    i + horizon
+                    >= len(df)
+                ):
+
+                    future_returns[
+                        horizon
+                    ] = np.nan
+
+                    continue
+
+                entry = (
+                    float(
+                        df["Open"].iloc[
+                            i + 1
+                        ]
+                    )
+                    *
+                    (
+                        1
+                        +
+                        SLIPPAGE_BPS
+                        /
+                        10000
+                    )
+                )
+
+                exit_price = (
+                    float(
+                        df["Close"].iloc[
+                            i + horizon
+                        ]
+                    )
+                    *
+                    (
+                        1
+                        -
+                        SLIPPAGE_BPS
+                        /
+                        10000
+                    )
+                )
+
+                future_returns[
+                    horizon
+                ] = (
+
+                    (
+                        exit_price
+                        -
+                        entry
+                    )
+                    /
+                    entry
+
+                    -
+                    transaction_cost_fraction()
+                )
+
+            observations.append(
+
+                {
+
+                    "date":
+                        str(
+                            features.index[
+                                i
+                            ].date()
+                        ),
+
+                    "ticker":
+                        ticker.replace(
+                            ".NS",
+                            ""
+                        ),
+
+                    "regime":
+                        regime,
+
+                    "raw_probability":
+                        raw_probability,
+
+                    "calibrated_probability":
+                        probability,
+
+                    "er1":
+                        er1,
+
+                    "er3":
+                        er3,
+
+                    "er5":
+                        er5,
+
+                    "rr1":
+                        rr1,
+
+                    "rr2":
+                        rr2,
+
+                    "rsi":
+                        float(
+                            row["rsi"]
+                        ),
+
+                    "volume":
+                        float(
+                            row["vol_ratio"]
+                        ),
+
+                    "action":
+                        action,
+
+                    "ret1":
+                        future_returns[
+                            1
+                        ],
+
+                    "ret3":
+                        future_returns[
+                            3
+                        ],
+
+                    "ret5":
+                        future_returns[
+                            5
+                        ],
+
+                    "stop_hit_5d":
+                        stop_hit,
+
+                    "target_hit_5d":
+                        target_hit,
+                }
+            )
+
+    # ========================================================
+    # OUTPUT
+    # ========================================================
+
+    output = pd.DataFrame(
+        observations
+    )
+
+    timestamp = (
+        datetime.now()
+        .strftime(
+            "%Y%m%d_%H%M%S"
+        )
+    )
+
+    if output.empty:
+
+        print(
+            "No observations generated."
+        )
+
+        return
+
+    raw_file = (
         Path("audit")
         /
-        f"market_alert_v6_3_10_"
-        f"{timestamp}.txt"
+        f"walkforward_v6_3_10_"
+        f"{timestamp}.csv"
     )
 
-    audit_file.write_text(
-        alert,
-        encoding="utf-8"
+    output.to_csv(
+        raw_file,
+        index=False
     )
 
     print("")
-    print(alert)
-    print("")
+    print(
+        "=" * 70
+    )
 
-    send_telegram(
-        alert
+    print(
+        "V6.3.10 WALK-FORWARD BACKTEST"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        f"Total candidate observations: "
+        f"{len(output)}"
+    )
+
+    # ========================================================
+    # ACTION COUNTS
+    # ========================================================
+
+    print("")
+    print(
+        "ACTION COUNTS:"
+    )
+
+    print(
+        output[
+            "action"
+        ].value_counts().to_string()
+    )
+
+    # ========================================================
+    # PERFORMANCE
+    # ========================================================
+
+    summaries = []
+
+    for selection in [
+        "TRADE",
+        "WATCH",
+        "WAIT",
+        "ALL"
+    ]:
+
+        if selection == "ALL":
+
+            subset = output
+
+        else:
+
+            subset = output[
+                output["action"]
+                ==
+                selection
+            ]
+
+        for horizon in [
+            1,
+            3,
+            5
+        ]:
+
+            series = (
+                subset[
+                    f"ret{horizon}"
+                ]
+                .dropna()
+            )
+
+            if series.empty:
+
+                continue
+
+            winners = (
+                series[
+                    series > 0
+                ]
+            )
+
+            losers = (
+                series[
+                    series <= 0
+                ]
+            )
+
+            if (
+                not losers.empty
+                and
+                losers.sum() != 0
+            ):
+
+                profit_factor = (
+                    winners.sum()
+                    /
+                    abs(
+                        losers.sum()
+                    )
+                )
+
+            else:
+
+                profit_factor = np.nan
+
+            summaries.append(
+
+                {
+
+                    "selection":
+                        selection,
+
+                    "horizon":
+                        horizon,
+
+                    "observations":
+                        len(series),
+
+                    "win_rate":
+                        float(
+                            (
+                                series > 0
+                            ).mean()
+                        ),
+
+                    "average_net_return":
+                        float(
+                            series.mean()
+                        ),
+
+                    "median_net_return":
+                        float(
+                            series.median()
+                        ),
+
+                    "average_winner":
+                        float(
+                            winners.mean()
+                        )
+                        if not winners.empty
+                        else np.nan,
+
+                    "average_loser":
+                        float(
+                            losers.mean()
+                        )
+                        if not losers.empty
+                        else np.nan,
+
+                    "profit_factor":
+                        profit_factor,
+
+                    "best":
+                        float(
+                            series.max()
+                        ),
+
+                    "worst":
+                        float(
+                            series.min()
+                        ),
+                }
+            )
+
+    summary = pd.DataFrame(
+        summaries
+    )
+
+    print("")
+    print(
+        "PERFORMANCE:"
+    )
+
+    print(
+        summary.to_string(
+            index=False
+        )
+    )
+
+    summary_file = (
+        Path("audit")
+        /
+        f"walkforward_summary_"
+        f"v6_3_10_"
+        f"{timestamp}.csv"
+    )
+
+    summary.to_csv(
+        summary_file,
+        index=False
+    )
+
+    # ========================================================
+    # PROBABILITY CALIBRATION
+    # ========================================================
+
+    output["probability_bucket"] = (
+        pd.cut(
+            output[
+                "calibrated_probability"
+            ],
+            [
+                0,
+                0.40,
+                0.45,
+                0.50,
+                0.55,
+                0.60,
+                0.65,
+                0.70,
+                0.75,
+                1.01
+            ],
+            right=False,
+            labels=[
+                "<40%",
+                "40-45%",
+                "45-50%",
+                "50-55%",
+                "55-60%",
+                "60-65%",
+                "65-70%",
+                "70-75%",
+                "75%+"
+            ]
+        )
+    )
+
+    calibration = (
+        output
+        .groupby(
+            "probability_bucket",
+            observed=False
+        )
+        .agg(
+
+            observations=(
+                "ret5",
+                "size"
+            ),
+
+            average_model_probability=(
+                "calibrated_probability",
+                "mean"
+            ),
+
+            actual_win_rate=(
+                "ret5",
+                lambda x:
+                (
+                    x > 0
+                ).mean()
+            ),
+
+            average_return=(
+                "ret5",
+                "mean"
+            )
+        )
+        .reset_index()
+    )
+
+    print("")
+    print(
+        "PROBABILITY CALIBRATION:"
+    )
+
+    print(
+        calibration.to_string(
+            index=False
+        )
+    )
+
+    calibration_file = (
+        Path("audit")
+        /
+        f"probability_calibration_"
+        f"v6_3_10_"
+        f"{timestamp}.csv"
+    )
+
+    calibration.to_csv(
+        calibration_file,
+        index=False
+    )
+
+    # ========================================================
+    # STOCK-LEVEL RESULTS
+    # ========================================================
+
+    trade_data = output[
+        output["action"]
+        ==
+        "TRADE"
+    ]
+
+    if not trade_data.empty:
+
+        symbols = (
+            trade_data
+            .groupby(
+                "ticker"
+            )
+            .agg(
+
+                observations=(
+                    "ret5",
+                    "size"
+                ),
+
+                win_rate=(
+                    "ret5",
+                    lambda x:
+                    (
+                        x > 0
+                    ).mean()
+                ),
+
+                average_return=(
+                    "ret5",
+                    "mean"
+                )
+            )
+            .reset_index()
+        )
+
+        # IMPORTANT:
+        # Only consider symbols with >=20 observations.
+        symbols = symbols[
+            symbols[
+                "observations"
+            ] >= 20
+        ]
+
+        symbols = symbols.sort_values(
+            [
+                "average_return",
+                "win_rate"
+            ],
+            ascending=False
+        )
+
+        print("")
+        print(
+            "TRADE SYMBOLS "
+            "WITH >=20 OBSERVATIONS:"
+        )
+
+        print(
+            symbols
+            .head(25)
+            .to_string(
+                index=False
+            )
+        )
+
+        symbol_file = (
+            Path("audit")
+            /
+            f"trade_symbol_performance_"
+            f"v6_3_10_"
+            f"{timestamp}.csv"
+        )
+
+        symbols.to_csv(
+            symbol_file,
+            index=False
+        )
+
+    print("")
+    print(
+        "=" * 70
+    )
+
+    print(
+        "V6.3.10 BACKTEST COMPLETED"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        "IMPORTANT:"
+    )
+
+    print(
+        "Do NOT promote V6.3.10 to "
+        "real-money trading solely from "
+        "this backtest."
+    )
+
+    print(
+        "A separate untouched "
+        "out-of-sample period should "
+        "be used before live deployment."
     )
 
 
