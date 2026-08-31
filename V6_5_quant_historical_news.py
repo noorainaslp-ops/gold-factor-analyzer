@@ -35,6 +35,7 @@ warnings.filterwarnings("ignore")
 
 VERSION = "V6.5.1"
 YF_VERSION = getattr(yf, "__version__", "unknown")
+RANDOM_STATE = 42
 
 AUDIT = Path(os.getenv("AUDIT_DIR", "audit"))
 AUDIT.mkdir(parents=True, exist_ok=True)
@@ -774,7 +775,7 @@ def run_backtest():
     print("=" * 78)
     print("V6.5.1 LEAKAGE-PROOF QUANT + HISTORICAL NEWS BACKTEST")
     print("=" * 78)
-    print("V6.5.1 source revision: 2026-08-31-CLEAN-REBUILD")
+    print("V6.5.1 source revision: 2026-08-31-CLEAN-REBUILD-FIX2")
     print("yfinance version:", YF_VERSION)
     print("Backtest period:", PERIOD)
     print("Round-trip cost:", f"{ROUND_TRIP_COST*100:.3f}%")
