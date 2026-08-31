@@ -1,18 +1,13 @@
-name: V6.4 Market Alert
+name: V6.4.1 Market Backtest
 
 on:
   workflow_dispatch:
-
-  schedule:
-    # 11:30 AM IST = 06:00 UTC
-    # Monday-Friday
-    - cron: "0 6 * * 1-5"
 
 permissions:
   contents: write
 
 jobs:
-  market-alert:
+  backtest:
     runs-on: ubuntu-latest
 
     steps:
@@ -30,7 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run V6.4
+      - name: Run V6.4.1 leakage-proof backtest
         env:
           MODE: BACKTEST
           BACKTEST_PERIOD: 6y
@@ -48,16 +43,13 @@ jobs:
           VALIDATION_FRACTION: "0.20"
           OOS_FRACTION: "0.20"
 
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
         run: |
-          python V6_4_leakage_proof_market_alert.py
+          python V6_4_1_leakage_proof_market_alert.py
 
-      - name: Upload V6.4 audit files
+      - name: Upload V6.4.1 audit files
         uses: actions/upload-artifact@v4
         with:
-          name: V6.4-backtest-audit
+          name: V6.4.1-backtest-audit
           path: audit/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
