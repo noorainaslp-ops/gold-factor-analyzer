@@ -1,104 +1,97 @@
-```
-# V6_5_3_quant_gemini_leakage_proof.py
+# V6_5_quant_historical_news.py
 #
 # V6.5.3 — LEAKAGE-PROOF QUANT + HISTORICAL GEMINI EXPERIMENT
 #
-# Purpose:
-#   1. Build strictly backward-looking OHLCV features.
-#   2. Generate future-return targets separately.
-#   3. Perform purged chronological walk-forward validation.
-#   4. Compare:
-#        A. QUANT
-#        B. GEMINI/NEWS ONLY (when historical scores exist)
-#        C. HYBRID QUANT + GEMINI (when historical scores exist)
-#   5. Never call Gemini retrospectively during a historical backtest.
-#   6. Never use OOS observations for model/weight/threshold selection.
+# IMPORTANT:
+# This file intentionally does NOT call Gemini during the historical
+# backtest. A historical Gemini experiment requires timestamped
+# Gemini/news scores that were generated from information available
+# at that historical time.
 #
-# Historical Gemini file:
+# Optional historical file:
 #   historical_gemini.csv
 #
 # Required columns:
 #   ticker,published_at,gemini_score
 #
-# gemini_score must represent information available AT THAT TIME.
-# Range recommended: -1 to +1.
-#
 # Example:
-#   ticker,published_at,gemini_score
-#   RELIANCE.NS,2024-01-15 08:30:00,0.42
+#   RELIANCE.NS,2025-01-15 08:30:00,0.42
 #
-# IMPORTANT:
-#   A current Gemini API call is NOT used as a historical feature.
-#   Doing that would contaminate the backtest.
+# gemini_score must be between -1 and +1.
 #
-# Production use:
-#   Run this historical experiment first.
-#   Only after a genuine OOS improvement is demonstrated should
-#   live Gemini scoring be considered.
+# If the file is absent, the program performs a QUANT-ONLY baseline.
+# It will NOT pretend that Gemini was tested.
 
 from __future__ import annotations
 
-import os
 import math
 import warnings
 from pathlib import Path
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from sklearn.ensemble import (
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
+)
 from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
-from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    brier_score_loss,
+    log_loss,
+    mean_absolute_error,
+)
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error
+from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
+
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
 VERSION = "V6.5.3"
-SOURCE_REVISION = "2026-08-31-LEAKAGE-PROOF-HYBRID"
+
+SOURCE_REVISION = (
+    "2026-08-31-LEAKAGE-PROOF-HYBRID-FINAL"
+)
 
 YEARS = 6
-ROUND_TRIP_COST = 0.0030
+
+ROUND_TRIP_COST = 0.003
 
 RANDOM_STATE = 42
 
-# Minimum training observations
-MIN_TRAIN = 1000
+MIN_TRAIN_OBS = 1000
 
-# Purge:
-# remove observations whose forward-return window can overlap
-# the prediction date / validation boundary.
-PURGE_DAYS = 10
+# Five trading-day purge.
+# We use 10 calendar days to safely cover weekends/holidays.
+PURGE_CALENDAR_DAYS = 10
 
-# Walk-forward retraining frequency
+# Retrain every 20 evaluation dates.
 RETRAIN_EVERY = 20
 
-# Trade probability threshold
-TRADE_PMIN = 0.55
+TRADE_PROBABILITY = 0.55
 
-# Minimum predicted net return
-TRADE_RMIN = 0.0020
+MIN_EXPECTED_RETURN = 0.002
 
-# Hybrid weights tested only on VALIDATION
-NEWS_WEIGHTS = np.array([
+HORIZONS = [1, 3, 5, 10]
+
+# Gemini weights are selected ONLY on validation.
+NEWS_WEIGHTS = [
     0.00,
     0.10,
     0.20,
     0.30,
     0.40,
     0.50,
-])
-
-HORIZONS = [1, 3, 5, 10]
+]
 
 AUDIT_DIR = Path("audit")
-AUDIT_DIR.mkdir(exist_ok=True)
+AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # ============================================================
 # UNIVERSE
@@ -170,472 +163,298 @@ TICKERS = [
     "POLYCAB.NS",
 ]
 
+
 # ============================================================
-# UTILITY FUNCTIONS
+# BASIC UTILITIES
 # ============================================================
-
-def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Robustly normalise yfinance output.
-
-    Handles:
-      - ordinary single-level OHLCV columns
-      - MultiIndex columns
-      - Series returned under a column
-    """
-
-    if df is None or len(df) == 0:
-        return pd.DataFrame()
-
-    df = df.copy()
-
-    if isinstance(df.columns, pd.MultiIndex):
-        # Prefer the OHLCV field level.
-        wanted = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
-
-        new_cols = []
-
-        for col in df.columns:
-            parts = [str(x) for x in col]
-
-            found = None
-
-            for p in parts:
-                if p in wanted:
-                    found = p
-                    break
-
-            if found is None:
-                found = parts[-1]
-
-            new_cols.append(found)
-
-        df.columns = new_cols
-
-        # Remove duplicate columns by taking the first valid one.
-        df = df.loc[:, ~df.columns.duplicated()]
-
-    else:
-        df.columns = [str(c) for c in df.columns]
-
-    required = ["Open", "High", "Low", "Close", "Volume"]
-
-    for c in required:
-        if c not in df.columns:
-            return pd.DataFrame()
-
-    for c in required:
-        if isinstance(df[c], pd.DataFrame):
-            df[c] = df[c].iloc[:, 0]
-
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df = df[required].copy()
-
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
-
-    return df
-
 
 def sigmoid(x):
-    x = np.clip(x, -30, 30)
+    x = np.clip(x, -30.0, 30.0)
     return 1.0 / (1.0 + np.exp(-x))
 
 
-def safe_float(x, default=np.nan):
+def safe_float(value, default=np.nan):
     try:
-        v = float(x)
-        return v if np.isfinite(v) else default
+        value = float(value)
+        if np.isfinite(value):
+            return value
     except Exception:
-        return default
+        pass
+    return default
 
 
 # ============================================================
-# TECHNICAL FEATURES
+# ROBUST YFINANCE OHLCV HANDLING
 # ============================================================
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
+def normalise_yfinance_columns(df):
+    """
+    Handles both normal yfinance DataFrames and MultiIndex
+    DataFrames.
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    This specifically prevents the earlier:
+        'Series' object has no attribute 'Close'
+    failure.
+    """
 
-    avg_gain = gain.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
+    if df is None:
+        return pd.DataFrame()
 
-    avg_loss = loss.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-
-    return 100 - (100 / (1 + rs))
-
-
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    prev_close = df["Close"].shift(1)
-
-    tr1 = df["High"] - df["Low"]
-    tr2 = (df["High"] - prev_close).abs()
-    tr3 = (df["Low"] - prev_close).abs()
-
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    return tr.rolling(period).mean()
-
-
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
 
     x = df.copy()
 
-    close = x["Close"]
-    volume = x["Volume"]
-
-    x["ret_1"] = close.pct_change(1)
-    x["ret_3"] = close.pct_change(3)
-    x["ret_5"] = close.pct_change(5)
-    x["ret_10"] = close.pct_change(10)
-    x["ret_20"] = close.pct_change(20)
-
-    x["vol_5"] = x["ret_1"].rolling(5).std()
-    x["vol_10"] = x["ret_1"].rolling(10).std()
-    x["vol_20"] = x["ret_1"].rolling(20).std()
-
-    x["rsi_7"] = rsi(close, 7)
-    x["rsi_14"] = rsi(close, 14)
-    x["rsi_21"] = rsi(close, 21)
-
-    x["atr_14"] = atr(x, 14)
-    x["atr_pct"] = x["atr_14"] / close
-
-    ema_10 = close.ewm(span=10, adjust=False).mean()
-    ema_20 = close.ewm(span=20, adjust=False).mean()
-    ema_50 = close.ewm(span=50, adjust=False).mean()
-
-    x["ema10_dist"] = close / ema_10 - 1
-    x["ema20_dist"] = close / ema_20 - 1
-    x["ema50_dist"] = close / ema_50 - 1
-
-    x["ema10_20"] = ema_10 / ema_20 - 1
-    x["ema20_50"] = ema_20 / ema_50 - 1
-
-    high20 = x["High"].rolling(20).max()
-    low20 = x["Low"].rolling(20).min()
-
-    x["breakout_20"] = close / high20.shift(1) - 1
-    x["breakdown_20"] = close / low20.shift(1) - 1
-
-    vol_mean20 = volume.rolling(20).mean()
-    vol_std20 = volume.rolling(20).std()
-
-    x["volume_z"] = (
-        (volume - vol_mean20) /
-        vol_std20.replace(0, np.nan)
-    )
-
-    x["range_pct"] = (x["High"] - x["Low"]) / close
-
-    x["close_location"] = (
-        (close - x["Low"]) /
-        (x["High"] - x["Low"]).replace(0, np.nan)
-    )
-
-    # Market-relative momentum proxy
-    x["momentum_accel"] = x["ret_5"] - x["ret_20"] / 4
-
-    return x
-
-
-# ============================================================
-# TARGETS
-# ============================================================
-
-def add_targets(df: pd.DataFrame) -> pd.DataFrame:
-
-    x = df.copy()
-
-    for h in HORIZONS:
-
-        # Future close return.
-        future_return = (
-            x["Close"].shift(-h) / x["Close"] - 1
-        )
-
-        x[f"target_{h}d"] = future_return
-
-        # Binary target.
-        x[f"up_{h}d"] = (
-            future_return > 0
-        ).astype(float)
-
-    return x
-
-
-# ============================================================
-# HISTORICAL GEMINI
-# ============================================================
-
-def load_historical_gemini() -> pd.DataFrame:
-
-    candidates = [
-        Path("historical_gemini.csv"),
-        Path("historical_news.csv"),
-        Path("data/historical_gemini.csv"),
-        Path("data/historical_news.csv"),
+    wanted = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Adj Close",
+        "Volume",
     ]
 
-    path = None
+    # --------------------------------------------------------
+    # MultiIndex columns
+    # --------------------------------------------------------
 
-    for p in candidates:
-        if p.exists():
-            path = p
-            break
+    if isinstance(x.columns, pd.MultiIndex):
 
-    if path is None:
+        flattened = []
 
-        print(
-            "HISTORICAL GEMINI: NOT FOUND — "
-            "RUNNING QUANT-ONLY BASELINE"
-        )
+        for col in x.columns:
 
-        return pd.DataFrame(
-            columns=[
-                "ticker",
-                "published_at",
-                "gemini_score"
+            pieces = [
+                str(part)
+                for part in col
             ]
-        )
 
-    news = pd.read_csv(path)
+            selected = None
 
-    required = {
-        "ticker",
-        "published_at",
-        "gemini_score"
-    }
+            for part in pieces:
+                if part in wanted:
+                    selected = part
+                    break
 
-    missing = required - set(news.columns)
+            if selected is None:
+                selected = pieces[-1]
+
+            flattened.append(selected)
+
+        x.columns = flattened
+
+        # If duplicate Close/Open/etc. columns exist,
+        # keep the first one.
+        x = x.loc[
+            :,
+            ~x.columns.duplicated()
+        ]
+
+    else:
+
+        x.columns = [
+            str(c)
+            for c in x.columns
+        ]
+
+    # --------------------------------------------------------
+    # Required fields
+    # --------------------------------------------------------
+
+    required = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume",
+    ]
+
+    missing = [
+        c for c in required
+        if c not in x.columns
+    ]
 
     if missing:
-        raise ValueError(
-            f"Historical Gemini file missing columns: {sorted(missing)}"
+        return pd.DataFrame()
+
+    for col in required:
+
+        series = x[col]
+
+        # Extremely defensive:
+        # if duplicate handling somehow left a DataFrame,
+        # use its first column.
+        if isinstance(series, pd.DataFrame):
+            series = series.iloc[:, 0]
+
+        x[col] = pd.to_numeric(
+            series,
+            errors="coerce"
         )
 
-    news = news.copy()
+    x = x[
+        required
+    ].copy()
 
-    news["ticker"] = news["ticker"].astype(str)
-
-    news["published_at"] = pd.to_datetime(
-        news["published_at"],
-        errors="coerce",
-        utc=True
-    )
-
-    news["gemini_score"] = pd.to_numeric(
-        news["gemini_score"],
-        errors="coerce"
-    )
-
-    news = news.dropna(
+    x = x.dropna(
         subset=[
-            "ticker",
-            "published_at",
-            "gemini_score"
+            "Open",
+            "High",
+            "Low",
+            "Close",
         ]
     )
 
-    news["gemini_score"] = (
-        news["gemini_score"]
-        .clip(-1, 1)
-    )
-
-    news = news.sort_values(
-        ["ticker", "published_at"]
-    )
-
-    print(
-        f"HISTORICAL GEMINI: FOUND — "
-        f"{len(news):,} timestamped observations"
-    )
-
-    return news
+    return x
 
 
-def attach_historical_gemini(
-    market: pd.DataFrame,
-    news: pd.DataFrame
-) -> pd.DataFrame:
-
-    if news.empty:
-
-        market["gemini_score"] = 0.0
-        market["gemini_available"] = 0
-
-        return market
-
-    market = market.copy()
-
-    market["signal_dt"] = pd.to_datetime(
-        market["date"],
-        utc=True
-    )
-
-    news = news.copy()
-
-    news["published_at"] = pd.to_datetime(
-        news["published_at"],
-        utc=True
-    )
-
-    market = market.sort_values(
-        ["ticker", "signal_dt"]
-    )
-
-    news = news.sort_values(
-        ["ticker", "published_at"]
-    )
-
-    # CRITICAL:
-    # only news published on or before the signal timestamp
-    # is eligible.
-    merged = pd.merge_asof(
-        market,
-        news,
-        left_on="signal_dt",
-        right_on="published_at",
-        by="ticker",
-        direction="backward",
-        tolerance=pd.Timedelta(days=7),
-        suffixes=("", "_news")
-    )
-
-    merged["gemini_score"] = (
-        pd.to_numeric(
-            merged["gemini_score"],
-            errors="coerce"
-        )
-        .fillna(0.0)
-        .clip(-1, 1)
-    )
-
-    merged["gemini_available"] = (
-        merged["published_at"].notna()
-    ).astype(int)
-
-    return merged
-
-
-# ============================================================
-# DATA BUILD
-# ============================================================
-
-def download_symbol(ticker: str) -> pd.DataFrame:
+def download_history(ticker):
 
     try:
 
-        df = yf.download(
+        raw = yf.download(
             ticker,
             period=f"{YEARS}y",
             interval="1d",
             auto_adjust=False,
             progress=False,
-            threads=False
+            threads=False,
         )
 
-        df = clean_columns(df)
+        df = normalise_yfinance_columns(
+            raw
+        )
 
         if df.empty:
             return pd.DataFrame()
 
-        df.index = pd.to_datetime(
+        dates = pd.to_datetime(
             df.index,
             errors="coerce"
         )
 
-        df = df[~df.index.isna()]
+        df = df.copy()
 
-        df["date"] = df.index
+        df["date"] = dates
 
-        return df.reset_index(drop=True)
+        df = df.dropna(
+            subset=["date"]
+        )
 
-    except Exception as e:
+        df = df.sort_values(
+            "date"
+        )
+
+        df = df.drop_duplicates(
+            subset=["date"],
+            keep="last"
+        )
+
+        df = df.reset_index(
+            drop=True
+        )
+
+        return df
+
+    except Exception as exc:
 
         print(
-            f"WARNING: {ticker} failed: {e}"
+            f"WARNING: {ticker} failed: {exc}"
         )
 
         return pd.DataFrame()
 
 
-def build_dataset(news: pd.DataFrame) -> pd.DataFrame:
+# ============================================================
+# TECHNICAL INDICATORS
+# ============================================================
 
-    rows = []
+def calculate_rsi(
+    close,
+    period=14
+):
 
-    print(
-        f"Loading {len(TICKERS)} symbols..."
+    delta = close.diff()
+
+    gain = delta.clip(
+        lower=0
     )
 
-    for i, ticker in enumerate(TICKERS, 1):
+    loss = -delta.clip(
+        upper=0
+    )
 
-        print(
-            f"Loading [{i}/{len(TICKERS)}] {ticker}"
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
+
+    rs = (
+        avg_gain /
+        avg_loss.replace(
+            0,
+            np.nan
         )
-
-        df = download_symbol(ticker)
-
-        if df.empty:
-
-            print(
-                f"WARNING: insufficient data for {ticker}; skipping."
-            )
-
-            continue
-
-        if len(df) < 300:
-
-            print(
-                f"WARNING: insufficient history for "
-                f"{ticker}; skipping."
-            )
-
-            continue
-
-        df = build_features(df)
-        df = add_targets(df)
-
-        df["ticker"] = ticker
-
-        rows.append(df)
-
-    if not rows:
-        raise RuntimeError(
-            "No valid market data were loaded."
-        )
-
-    data = pd.concat(
-        rows,
-        ignore_index=True
     )
 
-    data = attach_historical_gemini(
-        data,
-        news
+    result = (
+        100 -
+        100 / (1 + rs)
     )
 
-    data = data.sort_values(
-        ["date", "ticker"]
-    ).reset_index(drop=True)
+    return result
 
-    return data
+
+def calculate_atr(
+    df,
+    period=14
+):
+
+    previous_close = (
+        df["Close"].shift(1)
+    )
+
+    tr1 = (
+        df["High"] -
+        df["Low"]
+    )
+
+    tr2 = (
+        df["High"] -
+        previous_close
+    ).abs()
+
+    tr3 = (
+        df["Low"] -
+        previous_close
+    ).abs()
+
+    tr = pd.concat(
+        [
+            tr1,
+            tr2,
+            tr3,
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    return tr.rolling(
+        period
+    ).mean()
 
 
 # ============================================================
-# FEATURE DEFINITIONS
+# FEATURE ENGINEERING
 # ============================================================
 
 QUANT_FEATURES = [
@@ -664,18 +483,574 @@ QUANT_FEATURES = [
     "momentum_accel",
 ]
 
-GEMINI_FEATURE = [
-    "gemini_score"
-]
+
+def make_features(df):
+
+    x = df.copy()
+
+    close = x["Close"]
+    volume = x["Volume"]
+
+    # --------------------------------------------------------
+    # Historical returns
+    # --------------------------------------------------------
+
+    x["ret_1"] = (
+        close.pct_change(1)
+    )
+
+    x["ret_3"] = (
+        close.pct_change(3)
+    )
+
+    x["ret_5"] = (
+        close.pct_change(5)
+    )
+
+    x["ret_10"] = (
+        close.pct_change(10)
+    )
+
+    x["ret_20"] = (
+        close.pct_change(20)
+    )
+
+    # --------------------------------------------------------
+    # Volatility
+    # --------------------------------------------------------
+
+    daily_return = (
+        close.pct_change()
+    )
+
+    x["vol_5"] = (
+        daily_return
+        .rolling(5)
+        .std()
+    )
+
+    x["vol_10"] = (
+        daily_return
+        .rolling(10)
+        .std()
+    )
+
+    x["vol_20"] = (
+        daily_return
+        .rolling(20)
+        .std()
+    )
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    x["rsi_7"] = calculate_rsi(
+        close,
+        7
+    )
+
+    x["rsi_14"] = calculate_rsi(
+        close,
+        14
+    )
+
+    x["rsi_21"] = calculate_rsi(
+        close,
+        21
+    )
+
+    # --------------------------------------------------------
+    # ATR
+    # --------------------------------------------------------
+
+    x["atr_14"] = calculate_atr(
+        x,
+        14
+    )
+
+    x["atr_pct"] = (
+        x["atr_14"] /
+        close
+    )
+
+    # --------------------------------------------------------
+    # EMA structure
+    # --------------------------------------------------------
+
+    ema10 = (
+        close
+        .ewm(
+            span=10,
+            adjust=False
+        )
+        .mean()
+    )
+
+    ema20 = (
+        close
+        .ewm(
+            span=20,
+            adjust=False
+        )
+        .mean()
+    )
+
+    ema50 = (
+        close
+        .ewm(
+            span=50,
+            adjust=False
+        )
+        .mean()
+    )
+
+    x["ema10_dist"] = (
+        close / ema10 - 1
+    )
+
+    x["ema20_dist"] = (
+        close / ema20 - 1
+    )
+
+    x["ema50_dist"] = (
+        close / ema50 - 1
+    )
+
+    x["ema10_20"] = (
+        ema10 / ema20 - 1
+    )
+
+    x["ema20_50"] = (
+        ema20 / ema50 - 1
+    )
+
+    # --------------------------------------------------------
+    # Breakouts
+    #
+    # IMPORTANT:
+    # shift(1) means today's feature cannot use today's
+    # future information.
+    # --------------------------------------------------------
+
+    high20 = (
+        x["High"]
+        .rolling(20)
+        .max()
+    )
+
+    low20 = (
+        x["Low"]
+        .rolling(20)
+        .min()
+    )
+
+    x["breakout_20"] = (
+        close /
+        high20.shift(1) - 1
+    )
+
+    x["breakdown_20"] = (
+        close /
+        low20.shift(1) - 1
+    )
+
+    # --------------------------------------------------------
+    # Volume anomaly
+    # --------------------------------------------------------
+
+    volume_mean = (
+        volume
+        .rolling(20)
+        .mean()
+    )
+
+    volume_std = (
+        volume
+        .rolling(20)
+        .std()
+    )
+
+    x["volume_z"] = (
+        (volume - volume_mean) /
+        volume_std.replace(
+            0,
+            np.nan
+        )
+    )
+
+    # --------------------------------------------------------
+    # Candle/range structure
+    # --------------------------------------------------------
+
+    x["range_pct"] = (
+        (x["High"] - x["Low"]) /
+        close
+    )
+
+    candle_range = (
+        x["High"] - x["Low"]
+    ).replace(
+        0,
+        np.nan
+    )
+
+    x["close_location"] = (
+        (close - x["Low"]) /
+        candle_range
+    )
+
+    # --------------------------------------------------------
+    # Momentum acceleration
+    # --------------------------------------------------------
+
+    x["momentum_accel"] = (
+        x["ret_5"] -
+        x["ret_20"] / 4
+    )
+
+    return x
 
 
 # ============================================================
-# FEATURE/TARGET LEAKAGE CHECK
+# TARGET ENGINEERING
 # ============================================================
 
-def leakage_check():
+def add_targets(df):
 
-    target_terms = [
+    x = df.copy()
+
+    for horizon in HORIZONS:
+
+        future_return = (
+            x["Close"].shift(-horizon) /
+            x["Close"] -
+            1
+        )
+
+        x[
+            f"target_{horizon}d"
+        ] = future_return
+
+        x[
+            f"up_{horizon}d"
+        ] = (
+            future_return > 0
+        ).astype(float)
+
+    return x
+
+
+# ============================================================
+# HISTORICAL GEMINI DATA
+# ============================================================
+
+def load_historical_gemini():
+
+    candidates = [
+        Path("historical_gemini.csv"),
+        Path("historical_news.csv"),
+        Path("data/historical_gemini.csv"),
+        Path("data/historical_news.csv"),
+    ]
+
+    selected = None
+
+    for path in candidates:
+
+        if path.exists():
+
+            selected = path
+            break
+
+    if selected is None:
+
+        print(
+            "HISTORICAL GEMINI: NOT FOUND — "
+            "QUANT-ONLY BASELINE"
+        )
+
+        return pd.DataFrame(
+            columns=[
+                "ticker",
+                "published_at",
+                "gemini_score",
+            ]
+        )
+
+    news = pd.read_csv(
+        selected
+    )
+
+    required = {
+        "ticker",
+        "published_at",
+        "gemini_score",
+    }
+
+    missing = (
+        required -
+        set(news.columns)
+    )
+
+    if missing:
+
+        raise ValueError(
+            "Historical Gemini file is missing "
+            f"columns: {sorted(missing)}"
+        )
+
+    news = news.copy()
+
+    news["ticker"] = (
+        news["ticker"]
+        .astype(str)
+        .str.strip()
+    )
+
+    news["published_at"] = (
+        pd.to_datetime(
+            news["published_at"],
+            errors="coerce",
+            utc=True,
+        )
+    )
+
+    news["gemini_score"] = (
+        pd.to_numeric(
+            news["gemini_score"],
+            errors="coerce",
+        )
+    )
+
+    news = news.dropna(
+        subset=[
+            "ticker",
+            "published_at",
+            "gemini_score",
+        ]
+    )
+
+    news["gemini_score"] = (
+        news["gemini_score"]
+        .clip(-1, 1)
+    )
+
+    news = news[
+        news["ticker"].isin(
+            TICKERS
+        )
+    ]
+
+    news = news.sort_values(
+        [
+            "ticker",
+            "published_at",
+        ]
+    )
+
+    print(
+        f"HISTORICAL GEMINI: FOUND — "
+        f"{len(news):,} timestamped records"
+    )
+
+    return news
+
+
+# ============================================================
+# ATTACH HISTORICAL GEMINI
+# ============================================================
+
+def attach_gemini(
+    market,
+    news
+):
+
+    market = market.copy()
+
+    if news.empty:
+
+        market["gemini_score"] = 0.0
+
+        market[
+            "gemini_available"
+        ] = 0
+
+        return market
+
+    market["signal_timestamp"] = (
+        pd.to_datetime(
+            market["date"],
+            errors="coerce",
+            utc=True,
+        )
+    )
+
+    news = news.copy()
+
+    news = news.sort_values(
+        [
+            "ticker",
+            "published_at",
+        ]
+    )
+
+    market = market.sort_values(
+        [
+            "ticker",
+            "signal_timestamp",
+        ]
+    )
+
+    # --------------------------------------------------------
+    # CRITICAL LEAKAGE RULE
+    #
+    # direction="backward" means only a Gemini/news score
+    # published BEFORE the signal can be used.
+    #
+    # tolerance limits the news lookback to seven days.
+    # --------------------------------------------------------
+
+    merged = pd.merge_asof(
+        market,
+        news,
+        left_on="signal_timestamp",
+        right_on="published_at",
+        by="ticker",
+        direction="backward",
+        tolerance=pd.Timedelta(
+            days=7
+        ),
+    )
+
+    merged["gemini_available"] = (
+        merged["published_at"]
+        .notna()
+        .astype(int)
+    )
+
+    merged["gemini_score"] = (
+        pd.to_numeric(
+            merged["gemini_score"],
+            errors="coerce",
+        )
+        .fillna(0.0)
+        .clip(-1, 1)
+    )
+
+    # Explicit timestamp audit.
+    invalid = (
+        merged["published_at"].notna()
+        &
+        (
+            merged["published_at"] >
+            merged["signal_timestamp"]
+        )
+    )
+
+    if invalid.any():
+
+        raise RuntimeError(
+            "LEAKAGE FAILURE: historical Gemini "
+            "timestamp occurs after signal timestamp."
+        )
+
+    return merged
+
+
+# ============================================================
+# BUILD COMPLETE DATASET
+# ============================================================
+
+def build_dataset(news):
+
+    all_frames = []
+
+    print(
+        f"Loading [{len(TICKERS)}] symbols..."
+    )
+
+    for index, ticker in enumerate(
+        TICKERS,
+        start=1,
+    ):
+
+        print(
+            f"Loading [{index}/{len(TICKERS)}] "
+            f"{ticker}"
+        )
+
+        raw = download_history(
+            ticker
+        )
+
+        if raw.empty:
+
+            print(
+                f"WARNING: {ticker} "
+                "has no usable history; skipping."
+            )
+
+            continue
+
+        if len(raw) < 300:
+
+            print(
+                f"WARNING: insufficient history "
+                f"for {ticker}; skipping."
+            )
+
+            continue
+
+        frame = make_features(
+            raw
+        )
+
+        frame = add_targets(
+            frame
+        )
+
+        frame["ticker"] = ticker
+
+        all_frames.append(
+            frame
+        )
+
+    if not all_frames:
+
+        raise RuntimeError(
+            "No valid OHLCV datasets were created."
+        )
+
+    data = pd.concat(
+        all_frames,
+        ignore_index=True
+    )
+
+    data = attach_gemini(
+        data,
+        news
+    )
+
+    data = data.sort_values(
+        [
+            "date",
+            "ticker",
+        ]
+    ).reset_index(
+        drop=True
+    )
+
+    return data
+
+
+# ============================================================
+# LEAKAGE AUDIT
+# ============================================================
+
+def leakage_check(data):
+
+    forbidden = [
         "target_",
         "up_",
         "future",
@@ -686,13 +1061,31 @@ def leakage_check():
 
         low = feature.lower()
 
-        for term in target_terms:
+        for term in forbidden:
 
             if term in low:
 
                 raise RuntimeError(
-                    f"LEAKAGE FAILURE: {feature}"
+                    "FEATURE/TARGET LEAKAGE FAILURE: "
+                    f"{feature}"
                 )
+
+    if "published_at" in data.columns:
+
+        bad = (
+            data["published_at"].notna()
+            &
+            (
+                data["published_at"] >
+                data["signal_timestamp"]
+            )
+        )
+
+        if bad.any():
+
+            raise RuntimeError(
+                "HISTORICAL GEMINI TIMESTAMP LEAKAGE."
+            )
 
     print(
         "FEATURE/TARGET LEAKAGE CHECK: PASS"
@@ -704,291 +1097,399 @@ def leakage_check():
     )
 
     print(
-        "Historical Gemini timestamps are required "
-        "to be <= signal date."
+        "Historical Gemini/news timestamps must be "
+        "<= signal timestamp."
     )
 
 
 # ============================================================
-# MODEL FITTING
+# CHRONOLOGICAL SPLIT
 # ============================================================
 
-def prepare_xy(
-    df: pd.DataFrame,
-    features: list[str],
-    horizon: int
-):
+def split_data(data):
 
-    cols = features + [
-        f"target_{horizon}d",
-        f"up_{horizon}d"
+    dates = np.sort(
+        data["date"]
+        .dropna()
+        .unique()
+    )
+
+    if len(dates) < 300:
+
+        raise RuntimeError(
+            "Not enough unique dates for "
+            "chronological split."
+        )
+
+    n = len(dates)
+
+    dev_cut = dates[
+        int(n * 0.50)
     ]
 
-    x = df[cols].copy()
+    validation_cut = dates[
+        int(n * 0.75)
+    ]
+
+    development = data[
+        data["date"] < dev_cut
+    ].copy()
+
+    validation = data[
+        (data["date"] >= dev_cut)
+        &
+        (data["date"] < validation_cut)
+    ].copy()
+
+    oos = data[
+        data["date"] >= validation_cut
+    ].copy()
+
+    return (
+        development,
+        validation,
+        oos,
+    )
+
+
+# ============================================================
+# PURGING
+# ============================================================
+
+def purge_training(
+    training,
+    evaluation_date,
+):
+
+    cutoff = (
+        pd.Timestamp(
+            evaluation_date
+        )
+        -
+        pd.Timedelta(
+            days=PURGE_CALENDAR_DAYS
+        )
+    )
+
+    return training[
+        training["date"] < cutoff
+    ].copy()
+
+
+# ============================================================
+# PREPARE TRAINING MATRIX
+# ============================================================
+
+def prepare_training(
+    df,
+    features,
+    horizon,
+):
+
+    required = (
+        features +
+        [
+            f"target_{horizon}d",
+            f"up_{horizon}d",
+        ]
+    )
+
+    x = df[
+        required
+    ].copy()
 
     x = x.replace(
         [np.inf, -np.inf],
         np.nan
     )
 
-    valid = x.notna().all(axis=1)
+    valid = (
+        x.notna()
+        .all(axis=1)
+    )
 
-    x = x.loc[valid]
+    x = x.loc[
+        valid
+    ]
 
-    X = x[features]
+    X = x[
+        features
+    ]
 
-    y_return = x[f"target_{horizon}d"]
+    y_return = x[
+        f"target_{horizon}d"
+    ]
 
-    y_up = x[f"up_{horizon}d"].astype(int)
+    y_direction = x[
+        f"up_{horizon}d"
+    ].astype(int)
 
-    return X, y_up, y_return
+    return (
+        X,
+        y_direction,
+        y_return,
+    )
 
 
-def fit_models(
-    train: pd.DataFrame,
-    features: list[str],
-    horizon: int
+# ============================================================
+# FIT ENSEMBLE
+# ============================================================
+
+def fit_ensemble(
+    training,
+    features,
+    horizon,
 ):
 
-    X, y_up, y_return = prepare_xy(
-        train,
-        features,
-        horizon
+    X, y_direction, y_return = (
+        prepare_training(
+            training,
+            features,
+            horizon,
+        )
     )
 
-    if len(X) < MIN_TRAIN:
+    if len(X) < MIN_TRAIN_OBS:
 
         raise ValueError(
-            f"Insufficient training observations: {len(X)}"
+            "Insufficient training observations: "
+            f"{len(X)}"
         )
 
-    classifier = Pipeline([
-        (
-            "scale",
-            StandardScaler()
-        ),
-        (
-            "logistic",
-            LogisticRegression(
-                C=0.5,
-                max_iter=1000,
-                random_state=RANDOM_STATE
-            )
-        )
-    ])
+    # --------------------------------------------------------
+    # Logistic classifier
+    # --------------------------------------------------------
 
-    classifier.fit(
-        X,
-        y_up
+    logistic = Pipeline(
+        [
+            (
+                "scale",
+                StandardScaler()
+            ),
+            (
+                "model",
+                LogisticRegression(
+                    C=0.5,
+                    max_iter=1500,
+                    random_state=RANDOM_STATE,
+                ),
+            ),
+        ]
     )
 
-    gb_classifier = HistGradientBoostingClassifier(
-        max_iter=150,
-        learning_rate=0.04,
-        max_leaf_nodes=15,
-        l2_regularization=1.0,
-        random_state=RANDOM_STATE
+    logistic.fit(
+        X,
+        y_direction
+    )
+
+    # --------------------------------------------------------
+    # Gradient boosting classifier
+    # --------------------------------------------------------
+
+    gb_classifier = (
+        HistGradientBoostingClassifier(
+            max_iter=150,
+            learning_rate=0.04,
+            max_leaf_nodes=15,
+            l2_regularization=1.0,
+            random_state=RANDOM_STATE,
+        )
     )
 
     gb_classifier.fit(
         X,
-        y_up
+        y_direction
     )
 
-    ridge = Pipeline([
-        (
-            "scale",
-            StandardScaler()
-        ),
-        (
-            "ridge",
-            Ridge(alpha=10.0)
-        )
-    ])
+    # --------------------------------------------------------
+    # Ridge return model
+    # --------------------------------------------------------
+
+    ridge = Pipeline(
+        [
+            (
+                "scale",
+                StandardScaler()
+            ),
+            (
+                "model",
+                Ridge(
+                    alpha=10.0
+                ),
+            ),
+        ]
+    )
 
     ridge.fit(
         X,
         y_return
     )
 
-    gb_regressor = HistGradientBoostingRegressor(
-        max_iter=150,
-        learning_rate=0.04,
-        max_leaf_nodes=15,
-        l2_regularization=1.0,
-        random_state=RANDOM_STATE,
-        loss="squared_error"
+    # --------------------------------------------------------
+    # Gradient boosting return model
+    # --------------------------------------------------------
+
+    gb_return = (
+        HistGradientBoostingRegressor(
+            max_iter=150,
+            learning_rate=0.04,
+            max_leaf_nodes=15,
+            l2_regularization=1.0,
+            random_state=RANDOM_STATE,
+            loss="squared_error",
+        )
     )
 
-    gb_regressor.fit(
+    gb_return.fit(
         X,
         y_return
     )
 
     return {
-        "logistic": classifier,
+        "logistic": logistic,
         "gb_classifier": gb_classifier,
         "ridge": ridge,
-        "gb_regressor": gb_regressor,
+        "gb_return": gb_return,
     }
 
 
-def predict_models(
+# ============================================================
+# PREDICT
+# ============================================================
+
+def predict_ensemble(
     models,
-    df: pd.DataFrame,
-    features: list[str]
+    df,
+    features,
 ):
 
-    X = (
-        df[features]
-        .replace(
-            [np.inf, -np.inf],
-            np.nan
-        )
+    X = df[
+        features
+    ].replace(
+        [np.inf, -np.inf],
+        np.nan
     )
 
-    valid = X.notna().all(axis=1)
+    valid = (
+        X.notna()
+        .all(axis=1)
+    )
 
-    p = np.full(len(df), np.nan)
-    r = np.full(len(df), np.nan)
+    probability = np.full(
+        len(df),
+        np.nan,
+        dtype=float,
+    )
+
+    expected_return = np.full(
+        len(df),
+        np.nan,
+        dtype=float,
+    )
 
     if valid.any():
 
-        xv = X.loc[valid]
+        xv = X.loc[
+            valid
+        ]
 
-        p1 = models["logistic"].predict_proba(xv)[:, 1]
-        p2 = models["gb_classifier"].predict_proba(xv)[:, 1]
+        p1 = (
+            models["logistic"]
+            .predict_proba(xv)[:, 1]
+        )
 
-        r1 = models["ridge"].predict(xv)
-        r2 = models["gb_regressor"].predict(xv)
+        p2 = (
+            models["gb_classifier"]
+            .predict_proba(xv)[:, 1]
+        )
 
-        # Ensemble.
-        p[valid.to_numpy()] = (
+        r1 = (
+            models["ridge"]
+            .predict(xv)
+        )
+
+        r2 = (
+            models["gb_return"]
+            .predict(xv)
+        )
+
+        probability[
+            valid.to_numpy()
+        ] = (
             0.50 * p1 +
             0.50 * p2
         )
 
-        r[valid.to_numpy()] = (
+        expected_return[
+            valid.to_numpy()
+        ] = (
             0.50 * r1 +
             0.50 * r2
         )
 
-    return p, r
-
-
-# ============================================================
-# DATA SPLIT
-# ============================================================
-
-def chronological_split(data: pd.DataFrame):
-
-    dates = np.sort(
-        data["date"].dropna().unique()
-    )
-
-    n = len(dates)
-
-    dev_end = dates[
-        int(n * 0.50)
-    ]
-
-    val_end = dates[
-        int(n * 0.75)
-    ]
-
-    development = data[
-        data["date"] < dev_end
-    ].copy()
-
-    validation = data[
-        (data["date"] >= dev_end) &
-        (data["date"] < val_end)
-    ].copy()
-
-    oos = data[
-        data["date"] >= val_end
-    ].copy()
-
     return (
-        development,
-        validation,
-        oos
+        probability,
+        expected_return,
     )
 
 
 # ============================================================
-# PURGED TRAINING
-# ============================================================
-
-def purge_training(
-    train: pd.DataFrame,
-    prediction_date
-):
-
-    cutoff = pd.Timestamp(
-        prediction_date
-    ) - pd.Timedelta(
-        days=PURGE_DAYS
-    )
-
-    return train[
-        train["date"] < cutoff
-    ].copy()
-
-
-# ============================================================
-# WALK FORWARD
+# WALK-FORWARD ENGINE
 # ============================================================
 
 def walk_forward(
-    development: pd.DataFrame,
-    evaluation: pd.DataFrame,
-    features: list[str],
-    horizon: int
+    development,
+    evaluation,
+    features,
+    horizon,
 ):
 
     evaluation_dates = np.sort(
-        evaluation["date"].unique()
+        evaluation["date"]
+        .dropna()
+        .unique()
     )
 
     outputs = []
 
     models = None
 
-    for i, date in enumerate(
+    for position, date in enumerate(
         evaluation_dates
     ):
 
         if (
             models is None
-            or i % RETRAIN_EVERY == 0
+            or
+            position % RETRAIN_EVERY == 0
         ):
 
-            train = development[
+            training = development[
                 development["date"] < date
             ].copy()
 
-            train = purge_training(
-                train,
+            training = purge_training(
+                training,
                 date
             )
 
-            if len(train) < MIN_TRAIN:
+            if len(training) < MIN_TRAIN_OBS:
+
                 continue
 
             try:
 
-                models = fit_models(
-                    train,
+                models = fit_ensemble(
+                    training,
                     features,
-                    horizon
+                    horizon,
                 )
 
-            except Exception as e:
+            except Exception as exc:
 
                 print(
-                    f"WARNING: model fit failed "
-                    f"on {date}: {e}"
+                    f"WARNING: fit failed "
+                    f"for {date}: {exc}"
                 )
 
                 continue
@@ -1000,26 +1501,35 @@ def walk_forward(
         if day.empty:
             continue
 
-        p, r = predict_models(
+        p, r = predict_ensemble(
             models,
             day,
-            features
+            features,
         )
 
-        day["pred_probability"] = p
-        day["pred_return"] = r
+        day[
+            "pred_probability"
+        ] = p
+
+        day[
+            "pred_return"
+        ] = r
 
         day = day.dropna(
             subset=[
                 "pred_probability",
-                "pred_return"
+                "pred_return",
             ]
         )
 
         if not day.empty:
-            outputs.append(day)
+
+            outputs.append(
+                day
+            )
 
     if not outputs:
+
         return pd.DataFrame()
 
     return pd.concat(
@@ -1029,243 +1539,363 @@ def walk_forward(
 
 
 # ============================================================
-# GEMINI HYBRID
+# GEMINI/HYBRID PREDICTION
 # ============================================================
 
-def add_hybrid_predictions(
-    df: pd.DataFrame,
-    news_weight: float
+def create_hybrid(
+    df,
+    news_weight,
 ):
 
-    out = df.copy()
+    x = df.copy()
 
-    q_p = out["pred_probability"].clip(
-        0.001,
-        0.999
-    )
-
-    # Convert probability to log-odds.
-    q_logit = np.log(
-        q_p / (1 - q_p)
-    )
-
-    # Gemini score is mapped to directional probability.
-    g_score = out["gemini_score"].clip(
-        -1,
-        1
-    )
-
-    g_prob = 0.5 + 0.5 * g_score
-
-    g_prob = g_prob.clip(
-        0.001,
-        0.999
-    )
-
-    g_logit = np.log(
-        g_prob / (1 - g_prob)
-    )
-
-    # Convex logit combination.
-    hybrid_logit = (
-        (1 - news_weight) * q_logit +
-        news_weight * g_logit
-    )
-
-    out["hybrid_probability"] = sigmoid(
-        hybrid_logit
-    )
-
-    # Historical Gemini should influence expected return
-    # conservatively rather than mechanically.
-    #
-    # The factor below is deliberately small. Validation
-    # decides whether the weight is useful.
-    news_return_signal = (
-        0.005 * g_score
-    )
-
-    out["hybrid_return"] = (
-        (1 - news_weight) *
-        out["pred_return"] +
-        news_weight *
-        (
-            out["pred_return"] +
-            news_return_signal
+    quant_probability = (
+        x["pred_probability"]
+        .clip(
+            0.001,
+            0.999
         )
     )
 
-    return out
+    quant_logit = np.log(
+        quant_probability /
+        (1 - quant_probability)
+    )
+
+    gemini_score = (
+        x["gemini_score"]
+        .clip(-1, 1)
+    )
+
+    gemini_probability = (
+        0.5 +
+        0.5 *
+        gemini_score
+    )
+
+    gemini_probability = (
+        gemini_probability
+        .clip(
+            0.001,
+            0.999
+        )
+    )
+
+    gemini_logit = np.log(
+        gemini_probability /
+        (1 - gemini_probability)
+    )
+
+    hybrid_logit = (
+        (1 - news_weight) *
+        quant_logit
+        +
+        news_weight *
+        gemini_logit
+    )
+
+    x[
+        "hybrid_probability"
+    ] = sigmoid(
+        hybrid_logit
+    )
+
+    # Conservative Gemini return contribution.
+    #
+    # Validation decides whether Gemini should have
+    # any weight at all.
+    gemini_return_signal = (
+        0.005 *
+        gemini_score
+    )
+
+    x[
+        "hybrid_return"
+    ] = (
+        (1 - news_weight) *
+        x["pred_return"]
+        +
+        news_weight *
+        (
+            x["pred_return"]
+            +
+            gemini_return_signal
+        )
+    )
+
+    x[
+        "gemini_probability"
+    ] = gemini_probability
+
+    x[
+        "gemini_return"
+    ] = gemini_return_signal
+
+    return x
 
 
 # ============================================================
-# VALIDATION WEIGHT SELECTION
+# VALIDATION GEMINI WEIGHT SELECTION
 # ============================================================
 
-def select_news_weight(
-    validation: pd.DataFrame,
-    horizon: int
+def select_gemini_weight(
+    validation,
+    horizon,
 ):
 
     if validation.empty:
         return 0.0
 
-    has_news = (
-        validation["gemini_available"].sum()
-        > 0
+    available = (
+        validation[
+            "gemini_available"
+        ] == 1
     )
 
-    if not has_news:
+    if available.sum() < 50:
+
+        print(
+            "Historical Gemini coverage too low "
+            "for reliable weight selection."
+        )
+
         return 0.0
 
     best_weight = 0.0
     best_score = -np.inf
 
-    for w in NEWS_WEIGHTS:
+    for weight in NEWS_WEIGHTS:
 
-        x = add_hybrid_predictions(
+        candidate = create_hybrid(
             validation,
-            float(w)
+            weight
         )
+
+        candidate = candidate[
+            candidate[
+                "gemini_available"
+            ] == 1
+        ]
 
         signal = (
-            (x["hybrid_probability"] >= TRADE_PMIN) &
-            (x["hybrid_return"] >= TRADE_RMIN)
+            (
+                candidate[
+                    "hybrid_probability"
+                ]
+                >= TRADE_PROBABILITY
+            )
+            &
+            (
+                candidate[
+                    "hybrid_return"
+                ]
+                >= MIN_EXPECTED_RETURN
+            )
         )
 
-        selected = x.loc[signal]
+        selected = candidate[
+            signal
+        ]
 
         if len(selected) < 20:
             continue
 
-        ret = (
-            selected[f"target_{horizon}d"]
-            - ROUND_TRIP_COST
+        net = (
+            selected[
+                f"target_{horizon}d"
+            ]
+            -
+            ROUND_TRIP_COST
         )
 
-        avg = ret.mean()
+        average_return = (
+            net.mean()
+        )
 
-        win = (
-            ret > 0
+        win_rate = (
+            net > 0
         ).mean()
 
-        # Stability-oriented validation objective.
+        # Stability-aware objective.
         score = (
-            avg *
-            math.sqrt(len(selected))
+            average_return *
+            math.sqrt(
+                len(selected)
+            )
         )
+
+        # Small penalty for extremely low win rate.
+        if win_rate < 0.50:
+
+            score *= 0.75
 
         if (
             np.isfinite(score)
-            and score > best_score
+            and
+            score > best_score
         ):
 
             best_score = score
-            best_weight = float(w)
+            best_weight = float(
+                weight
+            )
 
     return best_weight
 
 
 # ============================================================
-# PERFORMANCE
+# PERFORMANCE METRICS
 # ============================================================
 
-def performance_table(
-    df: pd.DataFrame,
-    horizon: int,
-    probability_col: str,
-    return_col: str,
-    model_name: str
+def calculate_performance(
+    df,
+    horizon,
+    probability_column,
+    return_column,
+    model_name,
 ):
 
-    target = f"target_{horizon}d"
+    target_column = (
+        f"target_{horizon}d"
+    )
+
+    required = [
+        target_column,
+        probability_column,
+        return_column,
+    ]
 
     x = df[
-        [
-            target,
-            probability_col,
-            return_col
-        ]
+        required
     ].dropna()
 
     if x.empty:
         return None
 
-    actual_up = (
-        x[target] > 0
+    actual_direction = (
+        x[target_column] > 0
     ).astype(int)
 
-    p = x[probability_col].clip(
-        0.001,
-        0.999
+    probability = (
+        x[probability_column]
+        .clip(
+            0.001,
+            0.999
+        )
     )
 
-    pred_r = x[return_col]
+    predicted_return = (
+        x[return_column]
+    )
 
     directional_accuracy = (
-        ((p >= 0.5) == (actual_up == 1))
+        (
+            (
+                probability >= 0.5
+            )
+            ==
+            (
+                actual_direction == 1
+            )
+        )
         .mean()
     )
 
     try:
+
         brier = brier_score_loss(
-            actual_up,
-            p
+            actual_direction,
+            probability
         )
+
     except Exception:
+
         brier = np.nan
 
     try:
-        ll = log_loss(
-            actual_up,
-            p,
+
+        logloss = log_loss(
+            actual_direction,
+            probability,
             labels=[0, 1]
         )
-    except Exception:
-        ll = np.nan
 
-    mae = mean_absolute_error(
-        x[target],
-        pred_r
+    except Exception:
+
+        logloss = np.nan
+
+    return_mae = (
+        mean_absolute_error(
+            x[target_column],
+            predicted_return
+        )
     )
 
     signal = (
-        (p >= TRADE_PMIN) &
-        (pred_r >= TRADE_RMIN)
+        (
+            probability >=
+            TRADE_PROBABILITY
+        )
+        &
+        (
+            predicted_return >=
+            MIN_EXPECTED_RETURN
+        )
     )
 
-    selected = x.loc[signal]
+    selected = x[
+        signal
+    ]
 
     if selected.empty:
 
+        selected_n = 0
         selected_win = np.nan
-        selected_avg = np.nan
-        pf = np.nan
-        n_selected = 0
+        selected_average = np.nan
+        profit_factor = np.nan
 
     else:
 
         net = (
-            selected[target]
-            - ROUND_TRIP_COST
+            selected[target_column]
+            -
+            ROUND_TRIP_COST
+        )
+
+        selected_n = len(
+            selected
         )
 
         selected_win = (
             net > 0
         ).mean()
 
-        selected_avg = net.mean()
-
-        gains = net[net > 0].sum()
-        losses = -net[net < 0].sum()
-
-        pf = (
-            gains / losses
-            if losses > 0
-            else np.inf
+        selected_average = (
+            net.mean()
         )
 
-        n_selected = len(selected)
+        gross_profit = (
+            net[net > 0].sum()
+        )
+
+        gross_loss = (
+            -net[net < 0].sum()
+        )
+
+        if gross_loss > 0:
+
+            profit_factor = (
+                gross_profit /
+                gross_loss
+            )
+
+        elif gross_profit > 0:
+
+            profit_factor = np.inf
+
+        else:
+
+            profit_factor = np.nan
 
     return {
         "model": model_name,
@@ -1274,20 +1904,20 @@ def performance_table(
         "directional_accuracy":
             directional_accuracy,
         "brier_score": brier,
-        "log_loss": ll,
-        "return_mae": mae,
+        "log_loss": logloss,
+        "return_mae": return_mae,
         "mean_predicted_return":
-            pred_r.mean(),
+            predicted_return.mean(),
         "mean_actual_return":
-            x[target].mean(),
+            x[target_column].mean(),
         "selected_n_p>=55":
-            n_selected,
+            selected_n,
         "selected_win_rate":
             selected_win,
         "selected_average_net_return":
-            selected_avg,
+            selected_average,
         "selected_profit_factor":
-            pf,
+            profit_factor,
     }
 
 
@@ -1295,67 +1925,104 @@ def performance_table(
 # NON-OVERLAPPING TRADE TEST
 # ============================================================
 
-def nonoverlap_test(
-    df: pd.DataFrame,
-    horizon: int,
-    probability_col: str,
-    return_col: str
+def nonoverlapping_test(
+    df,
+    horizon,
+    probability_column,
+    return_column,
 ):
 
-    x = df.sort_values(
-        ["date", "ticker"]
-    ).copy()
+    x = df.copy()
 
     x = x[
-        (x[probability_col] >= TRADE_PMIN) &
-        (x[return_col] >= TRADE_RMIN)
+        (
+            x[probability_column]
+            >= TRADE_PROBABILITY
+        )
+        &
+        (
+            x[return_column]
+            >= MIN_EXPECTED_RETURN
+        )
     ].copy()
 
     if x.empty:
         return None
 
+    x = x.sort_values(
+        [
+            "date",
+            "ticker",
+        ]
+    )
+
     accepted = []
 
-    last_date = None
+    last_trade_date = None
 
     for _, row in x.iterrows():
 
-        d = pd.Timestamp(
+        current_date = pd.Timestamp(
             row["date"]
         )
 
         if (
-            last_date is None
-            or d >= last_date +
-            pd.Timedelta(days=horizon + 1)
+            last_trade_date is None
+            or
+            current_date >=
+            (
+                last_trade_date
+                +
+                pd.Timedelta(
+                    days=horizon + 1
+                )
+            )
         ):
 
-            accepted.append(row)
-            last_date = d
+            accepted.append(
+                row
+            )
+
+            last_trade_date = (
+                current_date
+            )
 
     if not accepted:
         return None
 
-    z = pd.DataFrame(
+    selected = pd.DataFrame(
         accepted
     )
 
     net = (
-        z[f"target_{horizon}d"]
-        - ROUND_TRIP_COST
+        selected[
+            f"target_{horizon}d"
+        ]
+        -
+        ROUND_TRIP_COST
     )
 
-    gains = net[net > 0].sum()
-    losses = -net[net < 0].sum()
-
-    pf = (
-        gains / losses
-        if losses > 0
-        else np.inf
+    positive = (
+        net[net > 0].sum()
     )
+
+    negative = (
+        -net[net < 0].sum()
+    )
+
+    if negative > 0:
+
+        profit_factor = (
+            positive /
+            negative
+        )
+
+    else:
+
+        profit_factor = np.inf
 
     return {
-        "trades": len(z),
+        "trades": len(selected),
         "win_rate":
             (net > 0).mean(),
         "average_net":
@@ -1366,114 +2033,176 @@ def nonoverlap_test(
             net.max(),
         "worst":
             net.min(),
+        "profit_factor":
+            profit_factor,
         "gross_sum_return":
-            z[f"target_{horizon}d"].sum(),
+            selected[
+                f"target_{horizon}d"
+            ].sum(),
         "net_sum_return":
             net.sum(),
-        "profit_factor":
-            pf,
     }
 
 
 # ============================================================
-# PORTFOLIO SIMULATION
+# PORTFOLIO TEST
 # ============================================================
 
 def portfolio_test(
-    df: pd.DataFrame,
-    horizon: int,
-    probability_col: str,
-    return_col: str
+    df,
+    horizon,
+    probability_column,
+    return_column,
 ):
 
     x = df.copy()
 
     x = x[
-        (x[probability_col] >= TRADE_PMIN) &
-        (x[return_col] >= TRADE_RMIN)
+        (
+            x[probability_column]
+            >= TRADE_PROBABILITY
+        )
+        &
+        (
+            x[return_column]
+            >= MIN_EXPECTED_RETURN
+        )
     ].copy()
 
     if x.empty:
         return None
 
-    # One best candidate per date.
-    x["score"] = (
-        x[probability_col]
-        * x[return_col].clip(lower=0)
+    x["selection_score"] = (
+        x[probability_column] *
+        x[return_column].clip(
+            lower=0
+        )
     )
 
+    # One strongest candidate per signal date.
     x = (
         x.sort_values(
-            ["date", "score"],
-            ascending=[True, False]
+            [
+                "date",
+                "selection_score",
+            ],
+            ascending=[
+                True,
+                False,
+            ],
         )
-        .groupby("date")
+        .groupby(
+            "date",
+            as_index=False
+        )
         .head(1)
+    )
+
+    x = x.sort_values(
+        "date"
     )
 
     capital = 100000.0
 
-    equity = [capital]
-
-    completed = 0
+    equity_curve = [
+        capital
+    ]
 
     for _, row in x.iterrows():
 
-        gross = safe_float(
-            row[f"target_{horizon}d"],
+        future_return = safe_float(
+            row[
+                f"target_{horizon}d"
+            ],
             0.0
         )
 
-        net = gross - ROUND_TRIP_COST
+        net_return = (
+            future_return
+            -
+            ROUND_TRIP_COST
+        )
 
         capital *= (
-            1 + net
+            1 + net_return
         )
 
-        equity.append(capital)
+        equity_curve.append(
+            capital
+        )
 
-        completed += 1
-
-    eq = np.array(equity)
+    equity = np.asarray(
+        equity_curve,
+        dtype=float
+    )
 
     total_return = (
-        capital / 100000.0 - 1
+        capital /
+        100000.0
+        -
+        1
     )
 
-    trading_dates = len(x)
+    trades = len(x)
 
-    if trading_dates > 0:
+    if trades > 0:
 
         years = (
-            trading_dates / 252
+            trades /
+            252.0
         )
 
-        cagr = (
-            (capital / 100000.0)
-            ** (1 / years)
-            - 1
-            if years > 0
-            else np.nan
-        )
+        if years > 0:
+
+            cagr = (
+                (
+                    capital /
+                    100000.0
+                )
+                **
+                (
+                    1 /
+                    years
+                )
+                -
+                1
+            )
+
+        else:
+
+            cagr = np.nan
 
     else:
+
         cagr = np.nan
 
-    running_max = np.maximum.accumulate(eq)
-
-    drawdown = (
-        eq / running_max - 1
+    running_max = np.maximum.accumulate(
+        equity
     )
 
-    max_drawdown = drawdown.min()
+    drawdown = (
+        equity /
+        running_max
+        -
+        1
+    )
 
-    daily_returns = pd.Series(
-        eq
-    ).pct_change().dropna()
+    max_drawdown = (
+        drawdown.min()
+    )
+
+    daily_returns = (
+        pd.Series(
+            equity
+        )
+        .pct_change()
+        .dropna()
+    )
 
     if (
         len(daily_returns) > 1
-        and daily_returns.std() > 0
+        and
+        daily_returns.std() > 0
     ):
 
         sharpe = (
@@ -1499,33 +2228,38 @@ def portfolio_test(
         "Sharpe":
             sharpe,
         "completed_trades":
-            completed,
+            trades,
     }
 
 
 # ============================================================
-# MAIN BACKTEST
+# MAIN
 # ============================================================
 
 def run_backtest():
 
     print("=" * 78)
+
     print(
         f"{VERSION} — "
-        "LEAKAGE-PROOF QUANT + GEMINI EXPERIMENT"
+        "LEAKAGE-PROOF QUANT + GEMINI"
     )
+
     print("=" * 78)
 
     print(
-        f"Source revision: {SOURCE_REVISION}"
+        f"Source revision: "
+        f"{SOURCE_REVISION}"
     )
 
     print(
-        f"yfinance version: {yf.__version__}"
+        f"yfinance version: "
+        f"{yf.__version__}"
     )
 
     print(
-        f"Backtest period: {YEARS}y"
+        f"Backtest period: "
+        f"{YEARS}y"
     )
 
     print(
@@ -1533,13 +2267,35 @@ def run_backtest():
         f"{ROUND_TRIP_COST:.3%}"
     )
 
-    news = load_historical_gemini()
+    print()
+
+    # --------------------------------------------------------
+    # Load historical Gemini scores
+    # --------------------------------------------------------
+
+    news = (
+        load_historical_gemini()
+    )
+
+    # --------------------------------------------------------
+    # Build OHLCV dataset
+    # --------------------------------------------------------
 
     data = build_dataset(
         news
     )
 
-    leakage_check()
+    # --------------------------------------------------------
+    # Leakage audit
+    # --------------------------------------------------------
+
+    leakage_check(
+        data
+    )
+
+    # --------------------------------------------------------
+    # Dataset statistics
+    # --------------------------------------------------------
 
     print()
     print("DATASET")
@@ -1559,19 +2315,27 @@ def run_backtest():
         f"{data['date'].nunique()}"
     )
 
-    coverage = (
-        data["gemini_available"].mean()
-        if "gemini_available" in data
-        else 0
+    gemini_coverage = (
+        data[
+            "gemini_available"
+        ].mean()
     )
 
     print(
         f"Historical Gemini coverage: "
-        f"{coverage:.2%}"
+        f"{gemini_coverage:.2%}"
     )
 
-    development, validation, oos = (
-        chronological_split(data)
+    # --------------------------------------------------------
+    # Chronological split
+    # --------------------------------------------------------
+
+    (
+        development,
+        validation,
+        oos,
+    ) = split_data(
+        data
     )
 
     print(
@@ -1605,18 +2369,26 @@ def run_backtest():
     )
 
     # --------------------------------------------------------
-    # OOS COMPARISON
+    # Results
     # --------------------------------------------------------
 
-    all_results = []
+    results = []
+
     nonoverlap_results = []
+
     portfolio_results = []
+
+    weight_records = []
+
+    # ========================================================
+    # EACH HORIZON
+    # ========================================================
 
     for horizon in HORIZONS:
 
         print()
         print(
-            "=" * 60
+            "=" * 78
         )
 
         print(
@@ -1624,213 +2396,279 @@ def run_backtest():
         )
 
         print(
-            "=" * 60
+            "=" * 78
         )
 
         # ----------------------------------------------------
-        # QUANT WALK FORWARD
+        # Validation quant predictions
         # ----------------------------------------------------
 
-        quant_oos = walk_forward(
-            development,
-            oos,
-            QUANT_FEATURES,
-            horizon
+        validation_predictions = (
+            walk_forward(
+                development,
+                validation,
+                QUANT_FEATURES,
+                horizon,
+            )
         )
 
-        if quant_oos.empty:
+        if validation_predictions.empty:
 
             print(
-                "WARNING: no OOS quant predictions."
+                "WARNING: validation produced "
+                "no predictions."
             )
 
             continue
 
         # ----------------------------------------------------
-        # VALIDATION WEIGHT
+        # Select Gemini weight on VALIDATION ONLY
         # ----------------------------------------------------
 
-        quant_val = walk_forward(
-            development,
-            validation,
-            QUANT_FEATURES,
-            horizon
+        selected_weight = (
+            select_gemini_weight(
+                validation_predictions,
+                horizon,
+            )
         )
 
-        if quant_val.empty:
-
-            selected_weight = 0.0
-
-        else:
-
-            selected_weight = (
-                select_news_weight(
-                    quant_val,
-                    horizon
-                )
-            )
-
         print(
-            f"Selected historical Gemini weight: "
+            f"Selected Gemini weight: "
             f"{selected_weight:.2f}"
         )
 
-        # ----------------------------------------------------
-        # QUANT RESULT
-        # ----------------------------------------------------
-
-        result = performance_table(
-            quant_oos,
-            horizon,
-            "pred_probability",
-            "pred_return",
-            "quant"
+        weight_records.append(
+            {
+                "horizon": horizon,
+                "selected_gemini_weight":
+                    selected_weight,
+            }
         )
 
-        if result:
-            all_results.append(
-                result
+        # ----------------------------------------------------
+        # OOS predictions
+        #
+        # OOS is never used for selecting weight.
+        # ----------------------------------------------------
+
+        oos_predictions = (
+            walk_forward(
+                development,
+                oos,
+                QUANT_FEATURES,
+                horizon,
             )
-
-        no = nonoverlap_test(
-            quant_oos,
-            horizon,
-            "pred_probability",
-            "pred_return"
         )
 
-        if no:
-
-            no["model"] = "quant"
-            no["horizon"] = horizon
-
-            nonoverlap_results.append(no)
-
-        po = portfolio_test(
-            quant_oos,
-            horizon,
-            "pred_probability",
-            "pred_return"
-        )
-
-        if po:
-
-            po["model"] = "quant"
-            po["horizon"] = horizon
-
-            portfolio_results.append(po)
-
-        # ----------------------------------------------------
-        # GEMINI / HYBRID
-        # ----------------------------------------------------
-
-        has_news = (
-            quant_oos["gemini_available"].sum()
-            > 0
-        )
-
-        if not has_news:
+        if oos_predictions.empty:
 
             print(
-                "Gemini experiment: NOT RUN "
-                "for this horizon — no historical scores."
+                "WARNING: OOS produced "
+                "no predictions."
             )
 
             continue
 
-        hybrid_oos = add_hybrid_predictions(
-            quant_oos,
-            selected_weight
+        # ----------------------------------------------------
+        # Save raw quant OOS
+        # ----------------------------------------------------
+
+        oos_predictions.to_csv(
+            AUDIT_DIR /
+            f"v6_5_3_oos_h{horizon}.csv",
+            index=False,
         )
 
-        # Gemini-only probability
-        hybrid_oos["gemini_probability"] = (
-            0.5 +
-            0.5 *
-            hybrid_oos["gemini_score"]
+        # ----------------------------------------------------
+        # QUANT
+        # ----------------------------------------------------
+
+        quant_result = (
+            calculate_performance(
+                oos_predictions,
+                horizon,
+                "pred_probability",
+                "pred_return",
+                "quant",
+            )
         )
 
-        # Gemini-only return signal
-        hybrid_oos["gemini_return"] = (
-            0.005 *
-            hybrid_oos["gemini_score"]
+        if quant_result:
+
+            results.append(
+                quant_result
+            )
+
+        quant_nonoverlap = (
+            nonoverlapping_test(
+                oos_predictions,
+                horizon,
+                "pred_probability",
+                "pred_return",
+            )
+        )
+
+        if quant_nonoverlap:
+
+            quant_nonoverlap[
+                "model"
+            ] = "quant"
+
+            quant_nonoverlap[
+                "horizon"
+            ] = horizon
+
+            nonoverlap_results.append(
+                quant_nonoverlap
+            )
+
+        quant_portfolio = (
+            portfolio_test(
+                oos_predictions,
+                horizon,
+                "pred_probability",
+                "pred_return",
+            )
+        )
+
+        if quant_portfolio:
+
+            quant_portfolio[
+                "model"
+            ] = "quant"
+
+            quant_portfolio[
+                "horizon"
+            ] = horizon
+
+            portfolio_results.append(
+                quant_portfolio
+            )
+
+        # ----------------------------------------------------
+        # HISTORICAL GEMINI EXPERIMENT
+        # ----------------------------------------------------
+
+        has_gemini = (
+            oos_predictions[
+                "gemini_available"
+            ].sum()
+            >= 50
+        )
+
+        if not has_gemini:
+
+            print(
+                "Gemini experiment: NOT RUN — "
+                "insufficient timestamped historical "
+                "Gemini coverage."
+            )
+
+            continue
+
+        hybrid = create_hybrid(
+            oos_predictions,
+            selected_weight,
         )
 
         # ----------------------------------------------------
         # GEMINI ONLY
         # ----------------------------------------------------
 
-        result = performance_table(
-            hybrid_oos,
-            horizon,
-            "gemini_probability",
-            "gemini_return",
-            "gemini_only"
+        gemini_result = (
+            calculate_performance(
+                hybrid,
+                horizon,
+                "gemini_probability",
+                "gemini_return",
+                "gemini_only",
+            )
         )
 
-        if result:
-            all_results.append(
-                result
+        if gemini_result:
+
+            results.append(
+                gemini_result
             )
 
         # ----------------------------------------------------
         # HYBRID
         # ----------------------------------------------------
 
-        result = performance_table(
-            hybrid_oos,
-            horizon,
-            "hybrid_probability",
-            "hybrid_return",
-            "hybrid"
+        hybrid_result = (
+            calculate_performance(
+                hybrid,
+                horizon,
+                "hybrid_probability",
+                "hybrid_return",
+                "hybrid",
+            )
         )
 
-        if result:
-            all_results.append(
-                result
+        if hybrid_result:
+
+            results.append(
+                hybrid_result
             )
 
-        no = nonoverlap_test(
-            hybrid_oos,
-            horizon,
-            "hybrid_probability",
-            "hybrid_return"
+        hybrid_nonoverlap = (
+            nonoverlapping_test(
+                hybrid,
+                horizon,
+                "hybrid_probability",
+                "hybrid_return",
+            )
         )
 
-        if no:
+        if hybrid_nonoverlap:
 
-            no["model"] = "hybrid"
-            no["horizon"] = horizon
+            hybrid_nonoverlap[
+                "model"
+            ] = "hybrid"
 
-            nonoverlap_results.append(no)
+            hybrid_nonoverlap[
+                "horizon"
+            ] = horizon
 
-        po = portfolio_test(
-            hybrid_oos,
-            horizon,
-            "hybrid_probability",
-            "hybrid_return"
+            nonoverlap_results.append(
+                hybrid_nonoverlap
+            )
+
+        hybrid_portfolio = (
+            portfolio_test(
+                hybrid,
+                horizon,
+                "hybrid_probability",
+                "hybrid_return",
+            )
         )
 
-        if po:
+        if hybrid_portfolio:
 
-            po["model"] = "hybrid"
-            po["horizon"] = horizon
+            hybrid_portfolio[
+                "model"
+            ] = "hybrid"
 
-            portfolio_results.append(po)
+            hybrid_portfolio[
+                "horizon"
+            ] = horizon
 
-        # Save horizon-level OOS file.
-        hybrid_oos.to_csv(
+            portfolio_results.append(
+                hybrid_portfolio
+            )
+
+        hybrid.to_csv(
             AUDIT_DIR /
-            f"v6_5_3_oos_h{horizon}.csv",
-            index=False
+            f"v6_5_3_hybrid_oos_h{horizon}.csv",
+            index=False,
         )
 
     # ========================================================
-    # SAVE RESULTS
+    # SAVE AUDIT FILES
     # ========================================================
 
     results_df = pd.DataFrame(
-        all_results
+        results
     )
 
     if not results_df.empty:
@@ -1838,8 +2676,18 @@ def run_backtest():
         results_df.to_csv(
             AUDIT_DIR /
             "v6_5_3_oos_model_comparison.csv",
-            index=False
+            index=False,
         )
+
+    weights_df = pd.DataFrame(
+        weight_records
+    )
+
+    weights_df.to_csv(
+        AUDIT_DIR /
+        "v6_5_3_selected_gemini_weights.csv",
+        index=False,
+    )
 
     nonoverlap_df = pd.DataFrame(
         nonoverlap_results
@@ -1850,7 +2698,7 @@ def run_backtest():
         nonoverlap_df.to_csv(
             AUDIT_DIR /
             "v6_5_3_nonoverlap_oos.csv",
-            index=False
+            index=False,
         )
 
     portfolio_df = pd.DataFrame(
@@ -1862,11 +2710,11 @@ def run_backtest():
         portfolio_df.to_csv(
             AUDIT_DIR /
             "v6_5_3_portfolio_oos.csv",
-            index=False
+            index=False,
         )
 
     # ========================================================
-    # PRINT SUMMARY
+    # PRINT RESULTS
     # ========================================================
 
     print()
@@ -1879,7 +2727,7 @@ def run_backtest():
     if results_df.empty:
 
         print(
-            "No valid OOS results generated."
+            "No valid OOS results."
         )
 
     else:
@@ -1934,9 +2782,11 @@ def run_backtest():
 
     print()
     print("=" * 78)
+
     print(
         "V6.5.3 BACKTEST COMPLETED"
     )
+
     print("=" * 78)
 
     print(
@@ -1944,7 +2794,8 @@ def run_backtest():
     )
 
     print(
-        "1. OHLCV features are backward-looking."
+        "1. OHLCV features are strictly "
+        "backward-looking."
     )
 
     print(
@@ -1952,27 +2803,28 @@ def run_backtest():
     )
 
     print(
-        "3. Training observations are purged "
-        f"by {PURGE_DAYS} days."
+        "3. Training data are purged before "
+        "each prediction period."
     )
 
     print(
-        "4. Validation determines Gemini weight."
+        "4. Gemini weight is selected on "
+        "validation only."
     )
 
     print(
-        "5. OOS observations are not used "
-        "for model/weight selection."
+        "5. OOS data are never used for "
+        "model or weight selection."
     )
 
     print(
-        "6. Current Gemini calls are NEVER "
-        "used as historical information."
+        "6. Current Gemini API calls are "
+        "never substituted for historical scores."
     )
 
     print(
-        "7. Historical Gemini timestamps must "
-        "precede or equal the signal date."
+        "7. Historical Gemini information must "
+        "exist before the signal timestamp."
     )
 
     print(
@@ -1981,17 +2833,34 @@ def run_backtest():
     )
 
     print(
-        "9. Historical performance does not "
-        "guarantee future returns."
+        "9. Historical results do not guarantee "
+        "future performance."
     )
 
     print()
-    print(
-        "IMPORTANT: A Gemini improvement is only "
-        "credible if HYBRID beats QUANT on untouched "
-        "OOS data with sufficient observations and "
-        "reasonable stability."
-    )
+
+    if gemini_coverage < 0.01:
+
+        print(
+            "GEMINI STATUS: NOT TESTED."
+        )
+
+        print(
+            "To perform the genuine Gemini experiment, "
+            "provide historical_gemini.csv containing "
+            "timestamped scores."
+        )
+
+    else:
+
+        print(
+            "GEMINI STATUS: HISTORICAL DATA FOUND."
+        )
+
+        print(
+            "Compare QUANT vs HYBRID on untouched "
+            "OOS observations."
+        )
 
 
 # ============================================================
@@ -2001,4 +2870,3 @@ def run_backtest():
 if __name__ == "__main__":
 
     run_backtest()
-```
