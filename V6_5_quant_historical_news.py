@@ -1,4 +1,4 @@
-```python
+```
 # V6_5_3_quant_gemini_leakage_proof.py
 #
 # V6.5.3 — LEAKAGE-PROOF QUANT + HISTORICAL GEMINI EXPERIMENT
