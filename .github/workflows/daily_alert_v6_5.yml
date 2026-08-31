@@ -1,0 +1,44 @@
+name: V6.5 Quant + Historical News Backtest
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Check historical news
+        run: |
+          if [ -f data/historical_news.csv ]; then echo "Historical news file found."; else echo "Historical news file NOT found; quant-only comparison will run."; fi
+      - name: Run V6.5
+        env:
+          MODE: BACKTEST
+          BACKTEST_PERIOD: 6y
+          COST_BPS: "10"
+          SLIPPAGE_BPS: "5"
+          MIN_HISTORY: "220"
+          MIN_TRAIN: "2000"
+          VALIDATION_FRACTION: "0.20"
+          OOS_FRACTION: "0.20"
+          MAX_TRAIN_OBS: "12000"
+          NEWS_FILE: "data/historical_news.csv"
+          NEWS_LOOKBACK_DAYS: "5"
+          NEWS_DECAY_DAYS: "2.0"
+          NEWS_MIN_CONFIDENCE: "0.50"
+        run: python V6_5_quant_historical_news.py
+      - name: Upload audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: V6.5-backtest-audit
+          path: audit/
+          if-no-files-found: error
+          retention-days: 30
