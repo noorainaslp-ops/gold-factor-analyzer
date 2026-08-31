@@ -1,0 +1,63 @@
+name: V6.4 Market Alert
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # 11:30 AM IST = 06:00 UTC
+    # Monday-Friday
+    - cron: "0 6 * * 1-5"
+
+permissions:
+  contents: write
+
+jobs:
+  market-alert:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run V6.4
+        env:
+          MODE: BACKTEST
+          BACKTEST_PERIOD: 6y
+
+          CAPITAL: "100000"
+          MAX_POSITIONS: "3"
+          PORTFOLIO_HORIZON: "5"
+
+          COST_BPS: "10"
+          SLIPPAGE_BPS: "5"
+
+          MIN_HISTORY: "220"
+          MIN_TRAIN: "2000"
+
+          VALIDATION_FRACTION: "0.20"
+          OOS_FRACTION: "0.20"
+
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+        run: |
+          python V6_4_leakage_proof_market_alert.py
+
+      - name: Upload V6.4 audit files
+        uses: actions/upload-artifact@v4
+        with:
+          name: V6.4-backtest-audit
+          path: audit/
+          if-no-files-found: warn
+          retention-days: 30
