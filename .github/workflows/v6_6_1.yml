@@ -1,0 +1,48 @@
+name: V6.6.1 Stability Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Show repository
+        run: |
+          echo "Repository root:"
+          ls -la
+          echo "Data:"
+          ls -la data || true
+
+      - name: Run V6.6.1
+        env:
+          BACKTEST_PERIOD: 6y
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python V6_6_1_leakage_proof_market_alert.py
+
+      - name: Upload audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: V6.6.1-audit
+          path: audit/
+          if-no-files-found: error
+          retention-days: 30
