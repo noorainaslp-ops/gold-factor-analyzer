@@ -70,7 +70,7 @@ warnings.filterwarnings("ignore")
 # ============================================================
 
 VERSION = "V6.6.1"
-REVISION = "2026-08-31-STABILITY-PORTFOLIO-BOOTSTRAP"
+REVISION = "2026-08-31-NAN-FIX2-STABLE"
 
 YEARS = 6
 RANDOM_STATE = 42
@@ -980,25 +980,25 @@ def fit_model(
         random_state=RANDOM_STATE,
     )
 
-    X_train = _finite_features(X_train)
+    # FINAL NaN/Inf guard: sanitize the exact matrix passed to every estimator.
+    X = _finite_features(X)
+    if not np.isfinite(X.to_numpy(dtype=float) if isinstance(X, pd.DataFrame) else np.asarray(X, dtype=float)).all():
+        raise ValueError("Feature sanitization failed: non-finite values remain in X")
     clf1.fit(
         X,
         y_direction
     )
 
-    X_train = _finite_features(X_train)
     clf2.fit(
         X,
         y_direction
     )
 
-    X_train = _finite_features(X_train)
     reg1.fit(
         X,
         y_return
     )
 
-    X_train = _finite_features(X_train)
     reg2.fit(
         X,
         y_return
