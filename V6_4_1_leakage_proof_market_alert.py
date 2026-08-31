@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-MULTI-FACTOR MARKET ALERT V6.4
-Leakage-proof chronological walk-forward + realistic trading audit.
+MULTI-FACTOR MARKET ALERT V6.4.1
+Leakage-proof chronological walk-forward backtest.
 
-IMPORTANT:
-- Primary target: 5-trading-day forward return.
-- Five-session purge is applied before every model fit.
-- Validation thresholds are frozen before OOS.
-- OOS observations are never used to fit/calibrate/select thresholds.
-- Non-overlapping portfolio/trade simulation is included.
-- LIVE mode uses the same ML signal logic as the backtest.
-- Gemini is intentionally NOT enabled yet. A clean hook is provided for V6.5.
+V6.4.1 fixes:
+1. Forward returns are TARGETS ONLY and are never written into feature columns.
+2. Five signal-date purge before every training fit.
+3. Validation threshold selection is isolated from OOS.
+4. Walk-forward predictions use only information available at prediction time.
+5. Non-overlapping event test is reported.
+6. Portfolio simulation uses actual sequential position accounting and drawdown.
+7. No Gemini dependency: Gemini should only be added after this baseline passes audit.
 
-Research only; not financial advice.
+Research only. Not financial advice.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from pathlib import Path
 from datetime import datetime
 import os
 import warnings
-import math
 
 import numpy as np
 import pandas as pd
@@ -36,43 +35,37 @@ from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V6.4"
+VERSION = "V6.4.1"
 AUDIT = Path(os.getenv("AUDIT_DIR", "audit"))
 AUDIT.mkdir(exist_ok=True)
 
 MODE = os.getenv("MODE", "BACKTEST").upper()
 PERIOD = os.getenv("BACKTEST_PERIOD", "6y")
 
-# Model / split settings
+HORIZON = 5
+PURGE_DAYS = 5
+
 MIN_HISTORY = int(os.getenv("MIN_HISTORY", "220"))
 MIN_TRAIN = int(os.getenv("MIN_TRAIN", "2000"))
+
 VAL_FRAC = float(os.getenv("VALIDATION_FRACTION", "0.20"))
 OOS_FRAC = float(os.getenv("OOS_FRACTION", "0.20"))
 
-# Critical leakage-control setting.
-# A 5-day target needs the last 5 observations purged from every training set.
-HORIZON = 5
-PURGE_DAYS = HORIZON
-
-# Costs are round-trip estimates: entry + exit.
+# Round-trip trading-cost assumption.
 COST_BPS = float(os.getenv("COST_BPS", "10"))
-SLIP_BPS = float(os.getenv("SLIPPAGE_BPS", "5"))
-ROUND_TRIP_COST = 2.0 * (COST_BPS + SLIP_BPS) / 10000.0
+SLIPPAGE_BPS = float(os.getenv("SLIPPAGE_BPS", "5"))
+ROUND_TRIP_COST = 2.0 * (COST_BPS + SLIPPAGE_BPS) / 10000.0
 
-# Validation threshold grid.
-PROB_GRID = [0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64]
-RET_GRID = [0.0000, 0.0005, 0.0010, 0.0015, 0.0020, 0.0030]
-
-# Portfolio simulation.
 CAPITAL = float(os.getenv("CAPITAL", "100000"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
 PORTFOLIO_HORIZON = int(os.getenv("PORTFOLIO_HORIZON", "5"))
 
-# Live output.
+PROB_GRID = [0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64]
+RET_GRID = [0.0000, 0.0005, 0.0010, 0.0015, 0.0020, 0.0030]
+
 TOP_TRADE = int(os.getenv("TOP_TRADE", "5"))
 TOP_WATCH = int(os.getenv("TOP_WATCH", "5"))
 
-# Telegram credentials are environment variables only.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -90,12 +83,18 @@ SYMBOLS = [
     "NAUKRI.NS","COFORGE.NS","JIOFIN.NS","IRFC.NS","IREDA.NS","POLYCAB.NS"
 ]
 
+# CRITICAL:
+# These are all BACKWARD-LOOKING features.
+# No *_fwd field is included here.
 FEATURES = [
-    "ret1","ret3","ret5","ret10","ret20",
-    "dist20","dist50","dist200","rsi","atr_pct",
-    "vol_ratio","vol20","rel20","mkt_ret5","mkt_ret20",
-    "mkt_dist50","mkt_vol20","regime","range_pct",
-    "close_location","breakout20"
+    "ret1_past", "ret3_past", "ret5_past", "ret10_past", "ret20_past",
+    "dist20", "dist50", "dist200",
+    "rsi", "atr_pct",
+    "vol_ratio", "vol20",
+    "rel20",
+    "mkt_ret5", "mkt_ret20", "mkt_dist50", "mkt_vol20",
+    "regime",
+    "range_pct", "close_location", "breakout20"
 ]
 
 
@@ -111,10 +110,12 @@ def clean(x: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     x = x[need].copy()
+
     for c in need:
         x[c] = pd.to_numeric(x[c], errors="coerce")
 
-    x = x.replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
+    x = x.replace([np.inf, -np.inf], np.nan)
+    x = x.dropna(subset=["Close"])
 
     try:
         if getattr(x.index, "tz", None) is not None:
@@ -159,12 +160,18 @@ def atr(x: pd.DataFrame, n: int = 14) -> pd.Series:
     return tr.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
 
 
-def features(stock: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
+def make_features(stock: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
     """
-    Create ONLY information available on each signal date.
+    Construct one row per signal date.
 
-    Forward returns are targets and are never included in FEATURES.
-    Market data are aligned to the stock's exact dates.
+    Every feature on date T uses only data at or before T.
+
+    Targets:
+      ret1_fwd = T+1 / T - 1
+      ret3_fwd = T+3 / T - 1
+      ret5_fwd = T+5 / T - 1
+
+    These forward values are NEVER part of FEATURES.
     """
     s = stock.copy()
     m = market.copy()
@@ -177,7 +184,6 @@ def features(stock: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         pass
 
-    # Only carry market information forward from dates that already existed.
     m = m.reindex(s.index).ffill()
 
     c = s["Close"]
@@ -189,24 +195,25 @@ def features(stock: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
     sma200 = c.rolling(200).mean()
     ms50 = mc.rolling(50).mean()
 
-    ret1 = c.pct_change()
-    ret3 = c.pct_change(3)
-    ret5 = c.pct_change(5)
-    ret10 = c.pct_change(10)
-    ret20 = c.pct_change(20)
+    # PAST returns. No negative shift.
+    ret1_past = c.pct_change(1)
+    ret3_past = c.pct_change(3)
+    ret5_past = c.pct_change(5)
+    ret10_past = c.pct_change(10)
+    ret20_past = c.pct_change(20)
 
     mr5 = mc.pct_change(5)
     mr20 = mc.pct_change(20)
 
-    vol20 = ret1.rolling(20).std()
+    vol20 = ret1_past.rolling(20).std()
     mvol20 = mr5.rolling(20).std()
 
-    high20 = s["High"].rolling(20).max()
+    high20_prior = s["High"].rolling(20).max().shift(1)
 
     regime = np.select(
         [
-            (mc > ms50 * 1.005),
-            (mc < ms50 * 0.995),
+            mc > ms50 * 1.005,
+            mc < ms50 * 0.995,
         ],
         [1.0, -1.0],
         default=0.0,
@@ -214,39 +221,52 @@ def features(stock: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
 
     f = pd.DataFrame(
         {
-            "ret1": ret1,
-            "ret3": ret3,
-            "ret5": ret5,
-            "ret10": ret10,
-            "ret20": ret20,
+            # BACKWARD-LOOKING FEATURES
+            "ret1_past": ret1_past,
+            "ret3_past": ret3_past,
+            "ret5_past": ret5_past,
+            "ret10_past": ret10_past,
+            "ret20_past": ret20_past,
+
             "dist20": c / sma20 - 1,
             "dist50": c / sma50 - 1,
             "dist200": c / sma200 - 1,
+
             "rsi": rsi(c),
             "atr_pct": atr(s) / c,
+
             "vol_ratio": v / v.rolling(20).mean(),
             "vol20": vol20,
-            "rel20": ret20 - mr20,
+
+            "rel20": ret20_past - mr20,
+
             "mkt_ret5": mr5,
             "mkt_ret20": mr20,
             "mkt_dist50": mc / ms50 - 1,
             "mkt_vol20": mvol20,
             "regime": regime,
+
             "range_pct": (s["High"] - s["Low"]) / c,
+
             "close_location": (
                 (c - s["Low"]) /
                 (s["High"] - s["Low"]).replace(0, np.nan)
             ),
-            "breakout20": c / high20.shift(1) - 1,
+
+            "breakout20": c / high20_prior - 1,
+
+            # informational fields, NOT model features
             "close": c,
             "market_close": mc,
         },
         index=s.index,
     )
 
-    for h in (1, 3, 5):
-        f[f"ret{h}_fwd"] = c.shift(-h) / c - 1
-
+    # FORWARD TARGETS ONLY.
+    # They are deliberately separate from FEATURES.
+    f["ret1_fwd"] = c.shift(-1) / c - 1
+    f["ret3_fwd"] = c.shift(-3) / c - 1
+    f["ret5_fwd"] = c.shift(-5) / c - 1
     f["y5"] = (f["ret5_fwd"] > 0).astype(float)
 
     return f.replace([np.inf, -np.inf], np.nan)
@@ -255,7 +275,7 @@ def features(stock: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
 def clf_model():
     return Pipeline(
         [
-            ("imp", SimpleImputer(strategy="median")),
+            ("imputer", SimpleImputer(strategy="median")),
             ("scale", StandardScaler()),
             (
                 "clf",
@@ -273,7 +293,7 @@ def clf_model():
 def ret_model():
     return Pipeline(
         [
-            ("imp", SimpleImputer(strategy="median")),
+            ("imputer", SimpleImputer(strategy="median")),
             ("scale", StandardScaler()),
             ("reg", Ridge(alpha=8.0)),
         ]
@@ -281,16 +301,19 @@ def ret_model():
 
 
 def fit(train: pd.DataFrame):
-    train = train.dropna(subset=["y5", "ret5"])
+    q = train.dropna(subset=["y5", "ret5_fwd"]).copy()
 
-    if len(train) < MIN_TRAIN or train.y5.nunique() < 2:
+    if len(q) < MIN_TRAIN:
+        return None, None
+
+    if q.y5.nunique() < 2:
         return None, None
 
     c = clf_model()
     r = ret_model()
 
-    c.fit(train[FEATURES], train.y5.astype(int))
-    r.fit(train[FEATURES], train.ret5)
+    c.fit(q[FEATURES], q["y5"].astype(int))
+    r.fit(q[FEATURES], q["ret5_fwd"])
 
     return c, r
 
@@ -298,15 +321,18 @@ def fit(train: pd.DataFrame):
 def predict(c, r, d: pd.DataFrame):
     p = c.predict_proba(d[FEATURES])[:, 1]
     q = r.predict(d[FEATURES])
-    return np.clip(p, 0.05, 0.95), q
+    return np.clip(p, 0.01, 0.99), q
 
 
 def calibrate_sigmoid(p, y):
-    """Calibration learned only from validation predictions."""
     p = np.clip(np.asarray(p), 1e-5, 1 - 1e-5)
     z = np.log(p / (1 - p)).reshape(-1, 1)
 
-    cal = LogisticRegression(C=1.0, max_iter=1000, random_state=17)
+    cal = LogisticRegression(
+        C=1.0,
+        max_iter=1000,
+        random_state=17,
+    )
     cal.fit(z, np.asarray(y).astype(int))
     return cal
 
@@ -314,14 +340,26 @@ def calibrate_sigmoid(p, y):
 def cal_predict(cal, p):
     p = np.clip(np.asarray(p), 1e-5, 1 - 1e-5)
     z = np.log(p / (1 - p)).reshape(-1, 1)
-    return np.clip(cal.predict_proba(z)[:, 1], 0.05, 0.95)
+    return np.clip(cal.predict_proba(z)[:, 1], 0.01, 0.99)
+
+
+def purge_training(prior: pd.DataFrame, prediction_date) -> pd.DataFrame:
+    """
+    Purge the last HORIZON signal dates.
+
+    If predicting on T, a training observation on T-4 is unusable
+    because its 5-day target reaches into the prediction date.
+    """
+    dates = sorted(prior.date.unique())
+
+    if len(dates) <= PURGE_DAYS:
+        return prior.iloc[0:0].copy()
+
+    cutoff = dates[-PURGE_DAYS - 1]
+    return prior[prior.date <= cutoff].copy()
 
 
 def choose_thresholds(v: pd.DataFrame):
-    """
-    Thresholds are optimized ONLY on validation data.
-    OOS is never touched here.
-    """
     best = None
 
     for pm in PROB_GRID:
@@ -332,25 +370,27 @@ def choose_thresholds(v: pd.DataFrame):
                 & (v.dist50 >= -0.025)
                 & (v.rsi.between(38, 70))
                 & (v.vol_ratio >= 0.65)
-            ]
+            ].copy()
 
             if len(g) < 100:
                 continue
 
-            x = g.net5
+            x = g["net5"].dropna()
             w = x[x > 0]
             l = x[x <= 0]
 
             pf = (
                 w.sum() / abs(l.sum())
                 if len(l) and l.sum() < 0
-                else 0
+                else np.nan
             )
 
+            # Prefer expected return while avoiding pathological
+            # solutions with very small sample sizes.
             score = (
-                100 * x.mean()
-                + 0.40 * np.log1p(max(pf, 0))
-                + 0.10 * ((x > 0).mean() - 0.5)
+                x.mean()
+                + 0.05 * ((x > 0).mean() - 0.5)
+                + 0.0005 * np.log1p(max(pf, 0))
             )
 
             cand = (
@@ -369,7 +409,7 @@ def choose_thresholds(v: pd.DataFrame):
     if best is None:
         return {
             "pmin": 0.58,
-            "rmin": 0.0010,
+            "rmin": 0.001,
             "n": 0,
             "avg": np.nan,
             "win": np.nan,
@@ -386,7 +426,7 @@ def choose_thresholds(v: pd.DataFrame):
     }
 
 
-def actions(d: pd.DataFrame, t: dict) -> pd.DataFrame:
+def apply_actions(d: pd.DataFrame, thresholds: dict) -> pd.DataFrame:
     out = []
 
     for _, x in d.iterrows():
@@ -395,23 +435,21 @@ def actions(d: pd.DataFrame, t: dict) -> pd.DataFrame:
             continue
 
         risk_ok = (
-            x.rsi >= 38
-            and x.rsi <= 70
+            38 <= x.rsi <= 70
             and x.vol_ratio >= 0.65
             and x.dist50 >= -0.025
         )
 
         if (
-            x.p_cal >= t["pmin"]
-            and x.pred_ret >= t["rmin"]
+            x.p_cal >= thresholds["pmin"]
+            and x.pred_ret >= thresholds["rmin"]
             and risk_ok
         ):
             out.append("TRADE")
         elif (
-            x.p_cal >= max(0.52, t["pmin"] - 0.04)
+            x.p_cal >= max(0.52, thresholds["pmin"] - 0.04)
             and x.pred_ret >= 0
-            and x.rsi >= 35
-            and x.rsi <= 72
+            and 35 <= x.rsi <= 72
         ):
             out.append("WATCH")
         else:
@@ -422,16 +460,24 @@ def actions(d: pd.DataFrame, t: dict) -> pd.DataFrame:
     return z
 
 
+def add_net_returns(d: pd.DataFrame) -> pd.DataFrame:
+    z = d.copy()
+
+    for h in (1, 3, 5):
+        z[f"net{h}"] = z[f"ret{h}_fwd"] - ROUND_TRIP_COST
+
+    return z
+
+
 def performance(d: pd.DataFrame) -> pd.DataFrame:
     rows = []
 
     if d.empty:
         return pd.DataFrame()
 
-    for a, g in d.groupby("action"):
+    for action, g in d.groupby("action"):
         for h in (1, 3, 5):
-            col = f"net{h}"
-            x = g[col].dropna()
+            x = g[f"net{h}"].dropna()
 
             if x.empty:
                 continue
@@ -447,7 +493,7 @@ def performance(d: pd.DataFrame) -> pd.DataFrame:
 
             rows.append(
                 {
-                    "selection": a,
+                    "selection": action,
                     "horizon": h,
                     "observations": len(x),
                     "win_rate": (x > 0).mean(),
@@ -477,7 +523,7 @@ def calibration_table(d: pd.DataFrame) -> pd.DataFrame:
     ]
 
     x["bucket"] = pd.cut(
-        x.p_cal,
+        x["p_cal"],
         bins=bins,
         labels=labels,
         right=False,
@@ -485,13 +531,13 @@ def calibration_table(d: pd.DataFrame) -> pd.DataFrame:
 
     rows = []
 
-    for b, g in x.groupby("bucket", observed=False):
+    for bucket, g in x.groupby("bucket", observed=False):
         if g.empty:
             continue
 
         rows.append(
             {
-                "probability_bucket": str(b),
+                "probability_bucket": str(bucket),
                 "observations": len(g),
                 "average_model_probability": g.p_cal.mean(),
                 "actual_win_rate": g.y5.mean(),
@@ -502,18 +548,18 @@ def calibration_table(d: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def prediction_metrics(d: pd.DataFrame) -> pd.DataFrame:
-    metrics = []
+def prediction_metrics(named_frames):
+    rows = []
 
-    for name, x in d:
-        q = x.dropna(
-            subset=["p_cal", "y5", "pred_ret", "ret5"]
-        )
+    for name, d in named_frames:
+        q = d.dropna(
+            subset=["p_cal", "y5", "pred_ret", "ret5_fwd"]
+        ).copy()
 
         if q.empty:
             continue
 
-        metrics.append(
+        rows.append(
             {
                 "sample": name,
                 "observations": len(q),
@@ -527,53 +573,52 @@ def prediction_metrics(d: pd.DataFrame) -> pd.DataFrame:
                     labels=[0, 1],
                 ),
                 "return_mae": mean_absolute_error(
-                    q.ret5,
+                    q.ret5_fwd,
                     q.pred_ret,
                 ),
                 "directional_accuracy": (
-                    (q.pred_ret > 0) == (q.ret5 > 0)
+                    (q.pred_ret > 0) == (q.ret5_fwd > 0)
                 ).mean(),
                 "mean_predicted_return": q.pred_ret.mean(),
-                "mean_actual_return": q.ret5.mean(),
+                "mean_actual_return": q.ret5_fwd.mean(),
             }
         )
 
-    return pd.DataFrame(metrics)
+    return pd.DataFrame(rows)
 
 
 def non_overlapping_trade_test(oos: pd.DataFrame) -> pd.DataFrame:
     """
-    Event-based test.
+    Non-overlapping 5-session event test.
 
-    A new 5-session trade can only be opened after the previous
-    selected trade's 5-session holding window has completed.
+    Select one qualifying trade, then do not select another trade
+    until at least HORIZON trading dates later.
 
-    This prevents overlapping observations from being counted
-    as independent sequential trades for this audit.
+    This is deliberately stricter than the observation-level report.
     """
-    if oos.empty:
-        return pd.DataFrame()
-
     x = oos[oos.action == "TRADE"].copy()
+
     if x.empty:
         return pd.DataFrame()
 
-    x = x.sort_values(["date", "ticker"]).reset_index(drop=True)
+    dates = sorted(x.date.unique())
+    date_to_i = {d: i for i, d in enumerate(dates)}
+
+    x["date_i"] = x.date.map(date_to_i)
+    x = x.sort_values(
+        ["date_i", "p_cal", "pred_ret"],
+        ascending=[True, False, False],
+    )
 
     selected = []
-    last_trade_date = None
+    last_i = None
 
     for _, row in x.iterrows():
-        if last_trade_date is None:
-            selected.append(row)
-            last_trade_date = row["date"]
-            continue
+        i = int(row.date_i)
 
-        # Signal dates are trading dates. Require at least HORIZON
-        # trading-date observations between selected entries.
-        if (row["date"] - last_trade_date).days >= HORIZON:
+        if last_i is None or i >= last_i + HORIZON:
             selected.append(row)
-            last_trade_date = row["date"]
+            last_i = i
 
     z = pd.DataFrame(selected)
 
@@ -589,48 +634,63 @@ def non_overlapping_trade_test(oos: pd.DataFrame) -> pd.DataFrame:
                 "median_5d_net": z.net5.median(),
                 "best_5d": z.net5.max(),
                 "worst_5d": z.net5.min(),
-                "gross_sum_return": z.ret5.sum(),
+                "gross_sum_return": z.ret5_fwd.sum(),
                 "net_sum_return": z.net5.sum(),
             }
         ]
     )
 
 
-def portfolio_backtest(oos: pd.DataFrame) -> pd.DataFrame:
+def portfolio_backtest(oos: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Conservative event-driven portfolio simulation.
 
-    - Starts with CAPITAL.
-    - At each signal date, ranks TRADE candidates by calibrated
-      probability, then predicted return.
-    - Opens up to MAX_POSITIONS.
-    - Equal allocation.
-    - Holds for exactly PORTFOLIO_HORIZON trading sessions.
-    - No overlapping positions beyond MAX_POSITIONS.
-    - Round-trip costs are already embedded in net5.
+    Important:
+    - Each position gets an equal allocation from available equity.
+    - A position exits after exactly PORTFOLIO_HORIZON trading sessions.
+    - Equity is marked using the actual selected trade's 5-day net return
+      only when its holding period completes.
+    - New positions are not allowed to consume already-committed cash.
+    - Open positions are tracked explicitly.
     """
     if oos.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     dates = sorted(oos.date.unique())
+    date_to_i = {d: i for i, d in enumerate(dates)}
+
     cash = CAPITAL
     positions = []
-    equity_curve = []
+    curve = []
 
-    for idx, date in enumerate(dates):
-        # Mark positions that reach their exit date.
-        remaining = []
+    trade_log = []
+
+    for i, date in enumerate(dates):
+        # Close positions whose holding period has completed.
+        still_open = []
+
         for pos in positions:
-            if idx >= pos["exit_idx"]:
-                cash += pos["allocation"] * (1 + pos["net_return"])
+            if i >= pos["exit_i"]:
+                proceeds = pos["allocation"] * (1 + pos["net_return"])
+                cash += proceeds
+
+                trade_log.append(
+                    {
+                        "ticker": pos["ticker"],
+                        "entry_date": pos["entry_date"],
+                        "exit_date": date,
+                        "allocation": pos["allocation"],
+                        "net_return": pos["net_return"],
+                        "pnl": proceeds - pos["allocation"],
+                    }
+                )
             else:
-                remaining.append(pos)
-        positions = remaining
+                still_open.append(pos)
 
-        # Open new positions only if capacity exists.
-        capacity = MAX_POSITIONS - len(positions)
+        positions = still_open
 
-        if capacity > 0:
+        # Available capital after existing commitments.
+        if len(positions) < MAX_POSITIONS:
             cur = oos[
                 (oos.date == date)
                 & (oos.action == "TRADE")
@@ -642,65 +702,99 @@ def portfolio_backtest(oos: pd.DataFrame) -> pd.DataFrame:
                     ascending=False,
                 )
 
-                # Equal allocation from currently available cash.
+                capacity = MAX_POSITIONS - len(positions)
                 slots = min(capacity, len(cur))
-                allocation = cash / max(slots, 1)
 
-                opened = 0
-                for _, row in cur.iterrows():
-                    if opened >= slots:
-                        break
-                    if allocation <= 0:
-                        break
+                # Use current free cash equally among new slots.
+                allocation = cash / slots if slots > 0 else 0
 
-                    exit_idx = idx + PORTFOLIO_HORIZON
-                    if exit_idx >= len(dates):
-                        # Cannot complete a full holding period.
+                for _, row in cur.head(slots).iterrows():
+                    exit_i = i + PORTFOLIO_HORIZON
+
+                    if exit_i >= len(dates):
                         continue
+
+                    if allocation <= 0:
+                        continue
+
+                    cash -= allocation
 
                     positions.append(
                         {
                             "ticker": row.ticker,
                             "entry_date": date,
-                            "exit_idx": exit_idx,
+                            "exit_i": exit_i,
                             "allocation": allocation,
                             "net_return": float(row.net5),
                         }
                     )
 
-                    cash -= allocation
-                    opened += 1
+        # Conservative mark-to-market:
+        # open positions remain at their entry value until exit because
+        # their future path is not available from the event dataset.
+        invested = sum(p["allocation"] for p in positions)
+        equity = cash + invested
 
-        marked = cash + sum(
-            pos["allocation"] for pos in positions
-        )
-        equity_curve.append(
+        curve.append(
             {
                 "date": date,
-                "equity": marked,
+                "equity": equity,
                 "cash": cash,
+                "invested": invested,
                 "open_positions": len(positions),
             }
         )
 
-    curve = pd.DataFrame(equity_curve)
+    curve = pd.DataFrame(curve)
 
     if curve.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
-    curve["daily_return"] = curve.equity.pct_change()
+    # Close any remaining positions at the end only if their complete
+    # 5-day outcome exists in the OOS data. Otherwise they remain
+    # excluded from final realized equity.
+    realized_equity = CAPITAL
 
-    running_max = curve.equity.cummax()
-    curve["drawdown"] = curve.equity / running_max - 1
+    for tr in trade_log:
+        realized_equity += tr["pnl"]
 
-    final_equity = float(curve.equity.iloc[-1])
+    # Build a realized-equity curve from completed trades.
+    realized = pd.DataFrame(
+        {
+            "date": curve["date"],
+            "equity": CAPITAL,
+        }
+    )
+
+    pnl_by_exit = (
+        pd.DataFrame(trade_log)
+        .groupby("exit_date")["pnl"]
+        .sum()
+        if trade_log
+        else pd.Series(dtype=float)
+    )
+
+    eq = CAPITAL
+    vals = []
+
+    for d in realized["date"]:
+        if d in pnl_by_exit.index:
+            eq += pnl_by_exit.loc[d]
+        vals.append(eq)
+
+    realized["equity"] = vals
+    realized["daily_return"] = realized.equity.pct_change().fillna(0)
+
+    running_max = realized.equity.cummax()
+    realized["drawdown"] = realized.equity / running_max - 1
+
+    final_equity = float(realized.equity.iloc[-1])
     total_return = final_equity / CAPITAL - 1
 
-    # Annualize using actual number of trading dates.
-    years = max(len(curve) / 252.0, 1 / 252.0)
+    years = max(len(realized) / 252.0, 1 / 252.0)
     cagr = (final_equity / CAPITAL) ** (1 / years) - 1
 
-    daily = curve.daily_return.dropna()
+    daily = realized.daily_return.iloc[1:]
     sharpe = (
         np.sqrt(252) * daily.mean() / daily.std()
         if len(daily) > 1 and daily.std() > 0
@@ -714,20 +808,42 @@ def portfolio_backtest(oos: pd.DataFrame) -> pd.DataFrame:
         else np.nan
     )
 
-    return pd.DataFrame(
+    summary = pd.DataFrame(
         [
             {
                 "starting_capital": CAPITAL,
-                "ending_equity": final_equity,
-                "total_return": total_return,
+                "ending_realized_equity": final_equity,
+                "total_realized_return": total_return,
                 "CAGR": cagr,
-                "max_drawdown": curve.drawdown.min(),
+                "max_drawdown": realized.drawdown.min(),
                 "Sharpe": sharpe,
                 "Sortino": sortino,
-                "trading_dates": len(curve),
+                "completed_trades": len(trade_log),
             }
         ]
     )
+
+    return summary, pd.DataFrame(trade_log)
+
+
+def chronological_split(d: pd.DataFrame):
+    dates = sorted(d.date.unique())
+    n = len(dates)
+
+    val_start_i = int(n * (1 - OOS_FRAC - VAL_FRAC))
+    oos_start_i = int(n * (1 - OOS_FRAC))
+
+    val_start = dates[val_start_i]
+    oos_start = dates[oos_start_i]
+
+    dev = d[d.date < val_start].copy()
+    val = d[
+        (d.date >= val_start)
+        & (d.date < oos_start)
+    ].copy()
+    oos = d[d.date >= oos_start].copy()
+
+    return dev, val, oos, val_start, oos_start
 
 
 def build_dataset():
@@ -735,6 +851,7 @@ def build_dataset():
     print(f"Backtest period: {PERIOD}")
 
     market = download_daily("^NSEI")
+
     if market.empty:
         raise RuntimeError("NIFTY data unavailable.")
 
@@ -751,83 +868,57 @@ def build_dataset():
                 print(f"WARNING: insufficient history for {sym}; skipping.")
                 continue
 
-            f = features(stock, market)
+            f = make_features(stock, market)
             successful += 1
+
+            # Need all 5 future target observations to exist.
+            for j in range(MIN_HISTORY - 1, len(f) - HORIZON):
+                x = f.iloc[j]
+
+                if x[FEATURES].isna().any():
+                    continue
+
+                row = {
+                    "ticker": sym,
+                    "date": f.index[j],
+                    "close": float(x["close"]),
+                    "market_close": float(x["market_close"]),
+                    "y5": float(x["y5"]),
+                    "ret1_fwd": float(x["ret1_fwd"]),
+                    "ret3_fwd": float(x["ret3_fwd"]),
+                    "ret5_fwd": float(x["ret5_fwd"]),
+                }
+
+                # CRITICAL:
+                # Copy only backward-looking FEATURES.
+                for col in FEATURES:
+                    row[col] = float(x[col])
+
+                rows.append(row)
 
         except Exception as exc:
             print(f"WARNING: {sym} failed: {exc}")
-            continue
-
-        # The final HORIZON observations cannot have a fully known target.
-        for j in range(MIN_HISTORY - 1, len(f) - HORIZON):
-            x = f.iloc[j]
-
-            if x[FEATURES].isna().any():
-                continue
-
-            r = {
-                "ticker": sym,
-                "date": f.index[j],
-                "close": float(x.close),
-                "market_close": float(x.market_close),
-            }
-
-            for col in FEATURES:
-                r[col] = float(x[col])
-
-            for h in (1, 3, 5):
-                r[f"ret{h}"] = float(x[f"ret{h}_fwd"])
-
-            r["y5"] = float(x.y5)
-            rows.append(r)
 
     d = pd.DataFrame(rows)
 
     if d.empty:
         raise RuntimeError("No candidate observations generated.")
 
-    d = d.sort_values(["date", "ticker"]).reset_index(drop=True)
+    d = d.sort_values(
+        ["date", "ticker"]
+    ).reset_index(drop=True)
+
+    # Safety assertion: future target fields must NOT overlap FEATURES.
+    overlap = set(FEATURES).intersection(
+        {"ret1_fwd", "ret3_fwd", "ret5_fwd", "y5"}
+    )
+
+    if overlap:
+        raise RuntimeError(
+            f"FATAL FEATURE/TARGET OVERLAP: {overlap}"
+        )
 
     return d, successful
-
-
-def purge_training(prior: pd.DataFrame, prediction_date) -> pd.DataFrame:
-    """
-    CRITICAL FIX.
-
-    For a prediction at T with a 5-session target, the latest usable
-    training observation must be at least 5 trading observations before T.
-
-    Using only date arithmetic is unsafe around weekends/holidays, so
-    the purge is based on the ordered unique signal dates.
-    """
-    dates = sorted(prior.date.unique())
-
-    if not dates:
-        return prior.iloc[0:0].copy()
-
-    # Remove the last PURGE_DAYS signal dates from prior.
-    cutoff_dates = dates[:-PURGE_DAYS] if len(dates) > PURGE_DAYS else []
-
-    if not cutoff_dates:
-        return prior.iloc[0:0].copy()
-
-    cutoff = cutoff_dates[-1]
-    return prior[prior.date <= cutoff].copy()
-
-
-def chronological_split(d: pd.DataFrame):
-    dates = sorted(d.date.unique())
-    n = len(dates)
-
-    val_start = dates[int(n * (1 - OOS_FRAC - VAL_FRAC))]
-    oos_start = dates[int(n * (1 - OOS_FRAC))]
-
-    dev = d[d.date < val_start].copy()
-    val = d[(d.date >= val_start) & (d.date < oos_start)].copy()
-    oos = d[d.date >= oos_start].copy()
-
-    return dev, val, oos, val_start, oos_start
 
 
 def run_backtest():
@@ -840,11 +931,9 @@ def run_backtest():
             f"Development sample too small: {len(dev)}"
         )
 
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------
     # DEVELOPMENT -> VALIDATION
-    # ------------------------------------------------------------
-    # Purge the end of development so validation predictions are
-    # never trained on labels that extend into validation.
+    # ---------------------------------------------------------
     dev_fit = purge_training(dev, val.date.min())
 
     print(
@@ -853,27 +942,32 @@ def run_backtest():
     )
 
     c, r = fit(dev_fit)
+
     if c is None:
         raise RuntimeError("Unable to fit development model.")
 
     val["p_raw"], val["pred_ret"] = predict(c, r, val)
 
-    # Calibration uses validation predictions only.
-    cal = calibrate_sigmoid(val.p_raw, val.y5)
-    val["p_cal"] = cal_predict(cal, val.p_raw)
+    cal = calibrate_sigmoid(
+        val.p_raw,
+        val.y5,
+    )
 
-    for h in (1, 3, 5):
-        val[f"net{h}"] = val[f"ret{h}"] - ROUND_TRIP_COST
+    val["p_cal"] = cal_predict(
+        cal,
+        val.p_raw,
+    )
+
+    val = add_net_returns(val)
 
     thresholds = choose_thresholds(val)
 
     print("\nVALIDATION-SELECTED THRESHOLDS:")
     print(thresholds)
 
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------
     # FINAL PRE-OOS MODEL
-    # ------------------------------------------------------------
-    # Purge the final 5 signal dates before OOS.
+    # ---------------------------------------------------------
     pre = d[d.date < oos_start].copy()
     pre_fit = purge_training(pre, oos_start)
 
@@ -883,22 +977,24 @@ def run_backtest():
     )
 
     cf, rf = fit(pre_fit)
+
     if cf is None:
         raise RuntimeError("Unable to fit final pre-OOS model.")
 
     oos["p_raw"], oos["pred_ret"] = predict(cf, rf, oos)
 
     # Calibration remains frozen from validation.
-    oos["p_cal"] = cal_predict(cal, oos.p_raw)
+    oos["p_cal"] = cal_predict(
+        cal,
+        oos.p_raw,
+    )
 
-    for h in (1, 3, 5):
-        oos[f"net{h}"] = oos[f"ret{h}"] - ROUND_TRIP_COST
+    oos = add_net_returns(oos)
+    oos = apply_actions(oos, thresholds)
 
-    oos = actions(oos, thresholds)
-
-    # ------------------------------------------------------------
-    # TRUE CHRONOLOGICAL WALK-FORWARD DIAGNOSTIC
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------
+    # PURGED CHRONOLOGICAL WALK-FORWARD
+    # ---------------------------------------------------------
     print("\nRunning PURGED chronological walk-forward diagnostics...")
 
     dates = sorted(d.date.unique())
@@ -911,12 +1007,14 @@ def run_backtest():
         if len(prior) < MIN_TRAIN:
             continue
 
-        prior_fit = purge_training(prior, date)
+        prior_fit = purge_training(
+            prior,
+            date,
+        )
 
         if len(prior_fit) < MIN_TRAIN:
             continue
 
-        # Keep the historical rolling window, but purge it first.
         prior_fit = prior_fit.tail(12000)
 
         cm, rm = fit(prior_fit)
@@ -924,31 +1022,44 @@ def run_backtest():
         if cm is None:
             continue
 
-        cur["p_raw"], cur["pred_ret"] = predict(cm, rm, cur)
+        cur["p_raw"], cur["pred_ret"] = predict(
+            cm,
+            rm,
+            cur,
+        )
 
-        # Frozen calibration + thresholds from validation only.
-        cur["p_cal"] = cal_predict(cal, cur.p_raw)
+        # Frozen calibration and thresholds from validation.
+        cur["p_cal"] = cal_predict(
+            cal,
+            cur.p_raw,
+        )
 
-        for h in (1, 3, 5):
-            cur[f"net{h}"] = cur[f"ret{h}"] - ROUND_TRIP_COST
+        cur = add_net_returns(cur)
+        cur = apply_actions(
+            cur,
+            thresholds,
+        )
 
-        cur = actions(cur, thresholds)
         wf_parts.append(cur)
 
         if k == 0 or k % 100 == 0 or k == len(dates) - 1:
             print(
-                f"Purged walk-forward date [{k+1}/{len(dates)}]"
+                f"Purged walk-forward date "
+                f"[{k+1}/{len(dates)}]"
             )
 
     wf = (
-        pd.concat(wf_parts, ignore_index=True)
+        pd.concat(
+            wf_parts,
+            ignore_index=True,
+        )
         if wf_parts
         else pd.DataFrame()
     )
 
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------
     # BENCHMARK
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------
     benchmark = (
         d.groupby("date")
         .market_close
@@ -958,23 +1069,18 @@ def run_backtest():
         .dropna()
     )
 
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------
     # REPORTS
-    # ------------------------------------------------------------
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # ---------------------------------------------------------
+    ts = datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    )
 
-    outputs = {
-        f"walkforward_v6_4_{ts}.csv": wf,
-        f"validation_v6_4_{ts}.csv": val,
-        f"oos_v6_4_{ts}.csv": oos,
-        f"action_group_performance_v6_4_{ts}.csv": performance(wf),
-        f"oos_performance_v6_4_{ts}.csv": performance(oos),
-        f"probability_calibration_v6_4_{ts}.csv": calibration_table(wf),
-        f"oos_probability_calibration_v6_4_{ts}.csv": calibration_table(oos),
-        f"threshold_selection_v6_4_{ts}.csv": pd.DataFrame([thresholds]),
-        f"nonoverlap_oos_v6_4_{ts}.csv": non_overlapping_trade_test(oos),
-        f"portfolio_oos_v6_4_{ts}.csv": portfolio_backtest(oos),
-    }
+    wf_perf = performance(wf)
+    oos_perf = performance(oos)
+
+    nonoverlap = non_overlapping_trade_test(oos)
+    portfolio_summary, portfolio_trades = portfolio_backtest(oos)
 
     metrics = prediction_metrics(
         [
@@ -983,25 +1089,40 @@ def run_backtest():
         ]
     )
 
-    outputs[f"prediction_metrics_v6_4_{ts}.csv"] = metrics
-
-    outputs[f"nifty_benchmark_v6_4_{ts}.csv"] = pd.DataFrame(
-        [
-            {
-                "observations": len(benchmark),
-                "win_rate": (benchmark > 0).mean(),
-                "average_5d_return": benchmark.mean(),
-                "median_5d_return": benchmark.median(),
-            }
-        ]
-    )
+    outputs = {
+        f"walkforward_v6_4_1_{ts}.csv": wf,
+        f"validation_v6_4_1_{ts}.csv": val,
+        f"oos_v6_4_1_{ts}.csv": oos,
+        f"action_group_performance_v6_4_1_{ts}.csv": wf_perf,
+        f"oos_performance_v6_4_1_{ts}.csv": oos_perf,
+        f"probability_calibration_v6_4_1_{ts}.csv": calibration_table(wf),
+        f"oos_probability_calibration_v6_4_1_{ts}.csv": calibration_table(oos),
+        f"threshold_selection_v6_4_1_{ts}.csv": pd.DataFrame([thresholds]),
+        f"nonoverlap_oos_v6_4_1_{ts}.csv": nonoverlap,
+        f"portfolio_oos_v6_4_1_{ts}.csv": portfolio_summary,
+        f"portfolio_trades_v6_4_1_{ts}.csv": portfolio_trades,
+        f"prediction_metrics_v6_4_1_{ts}.csv": metrics,
+        f"nifty_benchmark_v6_4_1_{ts}.csv": pd.DataFrame(
+            [
+                {
+                    "observations": len(benchmark),
+                    "win_rate": (benchmark > 0).mean(),
+                    "average_5d_return": benchmark.mean(),
+                    "median_5d_return": benchmark.median(),
+                }
+            ]
+        ),
+    }
 
     for name, frame in outputs.items():
-        frame.to_csv(AUDIT / name, index=False)
+        frame.to_csv(
+            AUDIT / name,
+            index=False,
+        )
 
-    print("\n" + "=" * 70)
-    print(f"{VERSION} PURGED CHRONOLOGICAL WALK-FORWARD BACKTEST")
-    print("=" * 70)
+    print("\n" + "=" * 72)
+    print(f"{VERSION} LEAKAGE-PROOF CHRONOLOGICAL WALK-FORWARD BACKTEST")
+    print("=" * 72)
 
     print(f"Total candidate observations: {len(d)}")
     print(f"Successful symbols: {successful}")
@@ -1012,7 +1133,13 @@ def run_backtest():
     print(f"OOS observations: {len(oos)}")
     print(f"Validation start: {val_start}")
     print(f"OOS start: {oos_start}")
-    print(f"Round-trip cost assumption: {ROUND_TRIP_COST*100:.3f}%")
+    print(
+        f"Round-trip cost assumption: "
+        f"{ROUND_TRIP_COST*100:.3f}%"
+    )
+
+    print("\nFEATURE/TARGET LEAKAGE CHECK:")
+    print("PASS — forward-return target fields are excluded from FEATURES.")
 
     print("\nFROZEN VALIDATION THRESHOLDS:")
     print(thresholds)
@@ -1027,30 +1154,44 @@ def run_backtest():
 
     print("\nOOS PERFORMANCE:")
     print(
-        performance(oos).to_string(index=False)
-        if not oos.empty
+        oos_perf.to_string(index=False)
+        if not oos_perf.empty
         else "None"
     )
 
     print("\nNON-OVERLAPPING OOS TRADE TEST:")
-    no = non_overlapping_trade_test(oos)
-    print(no.to_string(index=False) if not no.empty else "None")
+    print(
+        nonoverlap.to_string(index=False)
+        if not nonoverlap.empty
+        else "None"
+    )
 
     print("\nPORTFOLIO OOS TEST:")
-    po = portfolio_backtest(oos)
-    print(po.to_string(index=False) if not po.empty else "None")
+    print(
+        portfolio_summary.to_string(index=False)
+        if not portfolio_summary.empty
+        else "None"
+    )
 
     print("\nOOS PROBABILITY CALIBRATION:")
     cal_oos = calibration_table(oos)
-    print(cal_oos.to_string(index=False) if not cal_oos.empty else "None")
+    print(
+        cal_oos.to_string(index=False)
+        if not cal_oos.empty
+        else "None"
+    )
 
     print("\nPREDICTION METRICS:")
-    print(metrics.to_string(index=False) if not metrics.empty else "None")
+    print(
+        metrics.to_string(index=False)
+        if not metrics.empty
+        else "None"
+    )
 
     print("\nNIFTY 5-DAY BENCHMARK:")
     print(
         outputs[
-            f"nifty_benchmark_v6_4_{ts}.csv"
+            f"nifty_benchmark_v6_4_1_{ts}.csv"
         ].to_string(index=False)
     )
 
@@ -1058,39 +1199,37 @@ def run_backtest():
     for name in outputs:
         print(AUDIT / name)
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 72)
     print(f"{VERSION} BACKTEST COMPLETED")
-    print("=" * 70)
+    print("=" * 72)
 
     print(
-        "\nIMPORTANT:\n"
-        "1. The last 5 signal dates are purged from every training fit.\n"
-        "2. Validation thresholds are selected only on validation data.\n"
-        "3. OOS data are not used for fitting, calibration, or threshold selection.\n"
-        "4. Non-overlapping and portfolio tests are reported separately.\n"
-        "5. This is still a historical simulation; it does not guarantee future profit.\n"
+        "\nAUDIT NOTES:\n"
+        "1. Features are strictly backward-looking.\n"
+        "2. Forward returns are targets only.\n"
+        "3. Five signal dates are purged before model fitting.\n"
+        "4. Validation calibration/thresholds are frozen before OOS.\n"
+        "5. OOS labels are never used to fit or select thresholds.\n"
+        "6. Non-overlapping and portfolio results are reported separately.\n"
+        "7. Historical results do not guarantee future performance.\n"
     )
 
 
-# -----------------------------------------------------------------
-# LIVE SIGNAL ENGINE
-# -----------------------------------------------------------------
+# -------------------------------------------------------------
+# LIVE MODE
+# -------------------------------------------------------------
 
 def live_fit_and_score():
     """
-    Live mode:
-    - downloads current daily data
-    - uses only the latest COMPLETED daily bar
-    - trains on historical observations
-    - purges the last HORIZON dates from training
-    - applies fixed thresholds supplied through environment variables
-      or the conservative defaults.
+    Conservative live signal mode.
 
-    For production deployment, thresholds should be copied from the
-    most recent validated V6.4 audit and frozen until a new validation
-    run explicitly approves a change.
+    For safety, this is not activated by the backtest workflow.
+
+    LIVE_PMIN and LIVE_RMIN should be copied from a reviewed V6.4.1
+    validation run. Do not dynamically optimize them from live data.
     """
     market = download_daily("^NSEI")
+
     if market.empty:
         raise RuntimeError("NIFTY data unavailable.")
 
@@ -1099,107 +1238,155 @@ def live_fit_and_score():
     for sym in SYMBOLS:
         try:
             stock = download_daily(sym)
+
             if stock.empty or len(stock) < MIN_HISTORY:
                 continue
 
-            f = features(stock, market)
+            f = make_features(
+                stock,
+                market,
+            )
 
-            # Exclude the last bar if it is the current incomplete day.
-            # GitHub Actions should normally run after the market closes,
-            # but this makes the live path safer.
-            now = pd.Timestamp.now(tz=None).normalize()
-            f = f[f.index < now]
-
-            # Need enough history and a fully known historical target.
-            for j in range(MIN_HISTORY - 1, len(f) - HORIZON):
+            # Historical rows must have known targets for training.
+            for j in range(
+                MIN_HISTORY - 1,
+                len(f) - HORIZON,
+            ):
                 x = f.iloc[j]
 
                 if x[FEATURES].isna().any():
                     continue
 
-                r = {
+                row = {
                     "ticker": sym,
                     "date": f.index[j],
                     "close": float(x.close),
                     "market_close": float(x.market_close),
                     "y5": float(x.y5),
+                    "ret5_fwd": float(x.ret5_fwd),
                 }
 
                 for col in FEATURES:
-                    r[col] = float(x[col])
+                    row[col] = float(x[col])
 
-                r["ret5"] = float(x["ret5_fwd"])
-                rows.append(r)
+                rows.append(row)
 
         except Exception as exc:
-            print(f"LIVE WARNING {sym}: {exc}")
+            print(
+                f"LIVE WARNING {sym}: {exc}"
+            )
 
     d = pd.DataFrame(rows)
 
     if d.empty:
-        raise RuntimeError("No live training observations generated.")
+        raise RuntimeError(
+            "No live training observations generated."
+        )
 
-    d = d.sort_values(["date", "ticker"]).reset_index(drop=True)
+    d = d.sort_values(
+        ["date", "ticker"]
+    ).reset_index(drop=True)
 
     signal_date = d.date.max()
-    current = d[d.date == signal_date].copy()
+    current = d[
+        d.date == signal_date
+    ].copy()
 
-    # Purge training labels that are not fully known by signal_date.
-    train = d[d.date < signal_date].copy()
-    train = purge_training(train, signal_date)
+    train = d[
+        d.date < signal_date
+    ].copy()
+
+    train = purge_training(
+        train,
+        signal_date,
+    )
 
     if len(train) < MIN_TRAIN:
         raise RuntimeError(
-            f"Insufficient purged live training observations: {len(train)}"
+            f"Insufficient purged live training observations: "
+            f"{len(train)}"
         )
 
     c, r = fit(train)
+
     if c is None:
-        raise RuntimeError("Live model fit failed.")
+        raise RuntimeError(
+            "Live model fit failed."
+        )
 
-    current["p_raw"], current["pred_ret"] = predict(c, r, current)
-
-    # For live mode, use frozen thresholds from environment.
-    # These should be populated from the latest validated audit.
-    pmin = float(os.getenv("LIVE_PMIN", "0.50"))
-    rmin = float(os.getenv("LIVE_RMIN", "0.0020"))
-
-    frozen = {"pmin": pmin, "rmin": rmin}
-
-    # No new calibration is invented in live mode.
-    # Raw model probability is reported as raw model probability.
-    current["p_cal"] = current["p_raw"]
-    current = actions(current, frozen)
-
-    current = current.sort_values(
-        ["action", "p_cal", "pred_ret"],
-        ascending=[True, False, False],
+    current["p_raw"], current["pred_ret"] = predict(
+        c,
+        r,
+        current,
     )
 
-    trades = current[current.action == "TRADE"].sort_values(
-        ["p_cal", "pred_ret"],
-        ascending=False,
-    ).head(TOP_TRADE)
+    pmin = float(
+        os.getenv(
+            "LIVE_PMIN",
+            "0.58",
+        )
+    )
 
-    watch = current[current.action == "WATCH"].sort_values(
-        ["p_cal", "pred_ret"],
-        ascending=False,
-    ).head(TOP_WATCH)
+    rmin = float(
+        os.getenv(
+            "LIVE_RMIN",
+            "0.001",
+        )
+    )
+
+    thresholds = {
+        "pmin": pmin,
+        "rmin": rmin,
+    }
+
+    # NOTE:
+    # We deliberately do not pretend raw probability is calibrated.
+    # It is labeled raw model probability.
+    current["p_cal"] = current["p_raw"]
+
+    current = apply_actions(
+        current,
+        thresholds,
+    )
+
+    trades = (
+        current[
+            current.action == "TRADE"
+        ]
+        .sort_values(
+            ["p_cal", "pred_ret"],
+            ascending=False,
+        )
+        .head(TOP_TRADE)
+    )
+
+    watch = (
+        current[
+            current.action == "WATCH"
+        ]
+        .sort_values(
+            ["p_cal", "pred_ret"],
+            ascending=False,
+        )
+        .head(TOP_WATCH)
+    )
 
     lines = [
         f"MULTI-FACTOR MARKET ALERT {VERSION}",
-        datetime.now().astimezone().strftime("%d %b %Y, %H:%M %Z"),
+        datetime.now().astimezone().strftime(
+            "%d %b %Y, %H:%M %Z"
+        ),
         "",
         f"SIGNAL DATE: {signal_date}",
-        "--- TOP SHORT-TERM ML TRADE SETUPS (1–5 sessions) ---",
+        "",
+        "--- TOP ML TRADE CANDIDATES ---",
     ]
 
     if trades.empty:
         lines.extend(
             [
                 "",
-                "NO VALID LONG TRADE TODAY",
-                "No candidate currently satisfies the frozen V6.4 filters.",
+                "NO VALID TRADE CANDIDATE",
             ]
         )
     else:
@@ -1207,39 +1394,48 @@ def live_fit_and_score():
             lines.extend(
                 [
                     "",
-                    f"{row.ticker.replace('.NS','')} — TRADE CANDIDATE",
+                    f"{row.ticker.replace('.NS','')} — TRADE",
                     f"Price: ₹{row.close:,.2f}",
-                    f"P(UP): {row.p_cal*100:.1f}% (raw model; frozen live calibration not embedded)",
+                    f"Raw P(UP): {row.p_raw*100:.1f}%",
                     f"Predicted 5D return: {row.pred_ret*100:.2f}%",
-                    f"RSI: {row.rsi:.1f} | Volume: {row.vol_ratio:.2f}x",
-                    "NOTE: Confirm current live price before execution.",
-                ]
-            )
-
-    lines.extend(["", "--- BEST WATCHLIST SETUPS ---"])
-
-    if watch.empty:
-        lines.append("None.")
-    else:
-        for n, (_, row) in enumerate(watch.iterrows(), 1):
-            lines.extend(
-                [
-                    "",
-                    f"{n}. {row.ticker.replace('.NS','')} — WATCH",
-                    f"Price: ₹{row.close:,.2f}",
-                    f"P(UP): {row.p_cal*100:.1f}% | Predicted 5D return: {row.pred_ret*100:.2f}%",
-                    f"RSI: {row.rsi:.1f} | Volume: {row.vol_ratio:.2f}x",
+                    f"RSI: {row.rsi:.1f}",
+                    f"Volume ratio: {row.vol_ratio:.2f}x",
+                    "Confirm current market price before execution.",
                 ]
             )
 
     lines.extend(
         [
             "",
-            "--- V6.4 VALIDATION / SAFETY ---",
-            "Five-session training-label purge is enabled.",
-            "OOS observations are not used in this live fit.",
-            "This is a probabilistic research signal, not a guarantee.",
-            "Gemini/news layer is NOT enabled in V6.4.",
+            "--- WATCH ---",
+        ]
+    )
+
+    if watch.empty:
+        lines.append("None.")
+    else:
+        for n, (_, row) in enumerate(
+            watch.iterrows(),
+            1,
+        ):
+            lines.extend(
+                [
+                    "",
+                    f"{n}. {row.ticker.replace('.NS','')} — WATCH",
+                    f"Price: ₹{row.close:,.2f}",
+                    f"Raw P(UP): {row.p_raw*100:.1f}%",
+                    f"Predicted 5D return: {row.pred_ret*100:.2f}%",
+                ]
+            )
+
+    lines.extend(
+        [
+            "",
+            "--- AUDIT STATUS ---",
+            "V6.4.1 future-return feature leakage check: PASS.",
+            "Five-session purge: ENABLED.",
+            "Gemini/news layer: NOT ENABLED.",
+            "Historical model output is not a guarantee.",
         ]
     )
 
@@ -1251,6 +1447,7 @@ def live_fit_and_score():
             "https://api.telegram.org/"
             f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         )
+
         response = requests.post(
             url,
             json={
@@ -1259,41 +1456,14 @@ def live_fit_and_score():
             },
             timeout=20,
         )
+
         response.raise_for_status()
         print("Telegram message sent.")
     else:
-        print("Telegram credentials not configured; report printed only.")
-
-
-# -----------------------------------------------------------------
-# GEMINI HOOK — intentionally disabled in V6.4
-# -----------------------------------------------------------------
-
-def gemini_signal_hook(*args, **kwargs):
-    """
-    Reserved for V6.5.
-
-    Do NOT let an LLM replace the quantitative model.
-    The intended V6.5 design is:
-
-        V6.4 quantitative prediction
-                    +
-        Gemini-derived news/event features
-                    ↓
-             independently
-             validated ensemble
-
-    Gemini should return structured information features, not a
-    free-form "BUY/SELL" opinion.
-
-    This function intentionally raises an error so Gemini cannot
-    accidentally become part of the live V6.4 decision path.
-    """
-    raise RuntimeError(
-        "Gemini integration is intentionally disabled in V6.4. "
-        "Validate V6.4 first, then add Gemini as a separately tested "
-        "information layer in V6.5."
-    )
+        print(
+            "Telegram credentials not configured; "
+            "report printed only."
+        )
 
 
 if __name__ == "__main__":
