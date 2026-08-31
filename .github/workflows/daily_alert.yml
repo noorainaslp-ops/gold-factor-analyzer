@@ -1,0 +1,64 @@
+name: V6.4.2 Robust Quant Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run V6.4.2
+        env:
+          MODE: BACKTEST
+          BACKTEST_PERIOD: 6y
+
+          CAPITAL: "100000"
+          MAX_POSITIONS: "5"
+
+          COST_BPS: "10"
+          SLIPPAGE_BPS: "5"
+
+          MIN_HISTORY: "220"
+          MIN_TRAIN: "2000"
+
+          VALIDATION_FRACTION: "0.20"
+          OOS_FRACTION: "0.20"
+
+          MAX_TRAIN_OBS: "12000"
+
+          LOG_C: "0.25"
+          RIDGE_ALPHA: "10.0"
+
+          GB_MAX_ITER: "200"
+          GB_LEARNING_RATE: "0.04"
+          GB_MAX_LEAF_NODES: "15"
+          GB_L2: "2.0"
+
+        run: |
+          python V6_4_2_robust_quant_baseline.py
+
+      - name: Upload V6.4.2 audit files
+        uses: actions/upload-artifact@v4
+        with:
+          name: V6.4.2-backtest-audit
+          path: audit/
+          if-no-files-found: error
+          retention-days: 30
