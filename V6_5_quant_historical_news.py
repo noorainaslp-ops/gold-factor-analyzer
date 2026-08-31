@@ -43,6 +43,8 @@ from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error
 
 warnings.filterwarnings("ignore")
 
+YF_VERSION=getattr(yf,"__version__","unknown")
+
 VERSION="V6.5"
 AUDIT=Path(os.getenv("AUDIT_DIR","audit")); AUDIT.mkdir(exist_ok=True)
 NEWS_FILE=Path(os.getenv("NEWS_FILE","data/historical_news.csv"))
@@ -83,107 +85,252 @@ QUANT=PRICE+VOLUME+REL+MARKET
 HYBRID=QUANT+NEWS
 TARGETS={"ret1_fwd","ret3_fwd","ret5_fwd","ret10_fwd","y1","y3","y5","y10"}
 
+
 def clean(x):
-    if x is None or x.empty:return pd.DataFrame()
-    if isinstance(x.columns,pd.MultiIndex):x.columns=x.columns.get_level_values(0)
-    need=["Open","High","Low","Close","Volume"]
-    if any(c not in x.columns for c in need):return pd.DataFrame()
-    x=x[need].copy()
-    for c in need:x[c]=pd.to_numeric(x[c],errors="coerce")
-    x=x.replace([np.inf,-np.inf],np.nan).dropna(subset=["Close"]).sort_index()
+    """Convert every supported yfinance daily-data shape to OHLCV columns."""
+    if x is None:
+        return pd.DataFrame()
+
+    if isinstance(x, pd.Series):
+        x = x.to_frame()
+
+    if not isinstance(x, pd.DataFrame) or x.empty:
+        return pd.DataFrame()
+
+    wanted = ["Open", "High", "Low", "Close", "Volume"]
+
+    # yfinance can return MultiIndex columns such as:
+    # ('Close', 'RELIANCE.NS') or ('RELIANCE.NS', 'Close').
+    if isinstance(x.columns, pd.MultiIndex):
+        found_level = None
+        for level in range(x.columns.nlevels):
+            vals = {str(v) for v in x.columns.get_level_values(level)}
+            if set(wanted).issubset(vals):
+                found_level = level
+                break
+
+        if found_level is not None:
+            x = x.copy()
+            x.columns = x.columns.get_level_values(found_level)
+        else:
+            flattened = []
+            for col in x.columns:
+                match = next(
+                    (str(part) for part in col if str(part) in wanted),
+                    None
+                )
+                flattened.append(match if match else str(col))
+            x = x.copy()
+            x.columns = flattened
+
+    x = x.loc[:, ~pd.Index(x.columns).duplicated(keep="first")]
+
+    missing = [c for c in wanted if c not in x.columns]
+    if missing:
+        return pd.DataFrame()
+
+    x = x[wanted].copy()
+
+    for col in wanted:
+        x[col] = pd.to_numeric(x[col], errors="coerce")
+
+    x = x.replace([np.inf, -np.inf], np.nan)
+    x = x.dropna(subset=["Close"])
+    x = x.sort_index()
+
     try:
-        if getattr(x.index,"tz",None) is not None:x.index=x.index.tz_localize(None)
-    except Exception:pass
+        if getattr(x.index, "tz", None) is not None:
+            x.index = x.index.tz_localize(None)
+    except Exception:
+        pass
+
     return x[~x.index.duplicated(keep="last")]
 
+
 def download(symbol):
-    return clean(yf.download(symbol,period=PERIOD,interval="1d",auto_adjust=False,progress=False,threads=False))
+    raw = yf.download(
+        symbol,
+        period=PERIOD,
+        interval="1d",
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+        group_by="column"
+    )
+    return clean(raw)
 
-def calc_rsi(s,n=14):
-    d=s.diff(); up=d.clip(lower=0).ewm(alpha=1/n,adjust=False,min_periods=n).mean()
-    dn=(-d.clip(upper=0)).ewm(alpha=1/n,adjust=False,min_periods=n).mean()
-    return 100-100/(1+up/dn.replace(0,np.nan))
 
-def calc_atr(x,n=14):
-    pc=x.Close.shift(1)
-    tr=pd.concat([x.High-x.Low,(x.High-pc).abs(),(x.Low-pc).abs()],axis=1).max(axis=1)
-    return tr.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
+def calc_rsi(s, n=14):
+    d = s.diff()
+    up = d.clip(lower=0).ewm(
+        alpha=1/n, adjust=False, min_periods=n
+    ).mean()
+    dn = (-d.clip(upper=0)).ewm(
+        alpha=1/n, adjust=False, min_periods=n
+    ).mean()
+    return 100 - 100 / (1 + up / dn.replace(0, np.nan))
 
-def features(stock,market):
-    s=stock.copy(); m=market.reindex(s.index).ffill(); c=s.Close; v=s.Volume; mc=m.Close
-    sma20=c.rolling(20).mean(); sma50=c.rolling(50).mean(); sma200=c.rolling(200).mean()
-    ms20=mc.rolling(20).mean(); ms50=mc.rolling(50).mean()
-    r1=c.pct_change(); r3=c.pct_change(3); r5=c.pct_change(5); r10=c.pct_change(10); r20=c.pct_change(20)
-    mr1=mc.pct_change(); mr5=mc.pct_change(5); mr20=mc.pct_change(20)
-    prior=s.High.rolling(20).max().shift(1)
-    f=pd.DataFrame({
-        "ret1_past":r1,"ret3_past":r3,"ret5_past":r5,"ret10_past":r10,"ret20_past":r20,
-        "dist20":c/sma20-1,"dist50":c/sma50-1,"dist200":c/sma200-1,
-        "rsi":calc_rsi(c),"atr_pct":calc_atr(s)/c,
-        "range_pct":(s.High-s.Low)/c,
-        "close_location":(c-s.Low)/(s.High-s.Low).replace(0,np.nan),
-        "breakout20":c/prior-1,"vol_ratio":v/v.rolling(20).mean(),
-        "vol20":r1.rolling(20).std(),"rel5":r5-mr5,"rel20":r20-mr20,
-        "mkt_ret1":mr1,"mkt_ret5":mr5,"mkt_ret20":mr20,
-        "mkt_dist20":mc/ms20-1,"mkt_dist50":mc/ms50-1,
-        "mkt_vol20":mr1.rolling(20).std(),
-        "regime":np.select([mc>ms50*1.005,mc<ms50*.995],[1.,-1.],default=0.)},
-        index=s.index)
+
+def calc_atr(x, n=14):
+    prev_close = x["Close"].shift(1)
+    tr = pd.concat([
+        x["High"] - x["Low"],
+        (x["High"] - prev_close).abs(),
+        (x["Low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(
+        alpha=1/n, adjust=False, min_periods=n
+    ).mean()
+
+
+def features(stock, market):
+    s = stock.copy()
+    m = market.reindex(s.index).ffill()
+
+    close = s["Close"]
+    volume = s["Volume"]
+    mclose = m["Close"]
+
+    sma20 = close.rolling(20).mean()
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    msma20 = mclose.rolling(20).mean()
+    msma50 = mclose.rolling(50).mean()
+
+    ret1 = close.pct_change()
+    ret3 = close.pct_change(3)
+    ret5 = close.pct_change(5)
+    ret10 = close.pct_change(10)
+    ret20 = close.pct_change(20)
+
+    mret1 = mclose.pct_change()
+    mret5 = mclose.pct_change(5)
+    mret20 = mclose.pct_change(20)
+
+    prior_high20 = s["High"].rolling(20).max().shift(1)
+
+    f = pd.DataFrame({
+        "ret1_past": ret1,
+        "ret3_past": ret3,
+        "ret5_past": ret5,
+        "ret10_past": ret10,
+        "ret20_past": ret20,
+        "dist20": close / sma20 - 1,
+        "dist50": close / sma50 - 1,
+        "dist200": close / sma200 - 1,
+        "rsi": calc_rsi(close),
+        "atr_pct": calc_atr(s) / close,
+        "range_pct": (s["High"] - s["Low"]) / close,
+        "close_location":
+            (close - s["Low"]) /
+            (s["High"] - s["Low"]).replace(0, np.nan),
+        "breakout20": close / prior_high20 - 1,
+        "vol_ratio": volume / volume.rolling(20).mean(),
+        "vol20": ret1.rolling(20).std(),
+        "rel5": ret5 - mret5,
+        "rel20": ret20 - mret20,
+        "mkt_ret1": mret1,
+        "mkt_ret5": mret5,
+        "mkt_ret20": mret20,
+        "mkt_dist20": mclose / msma20 - 1,
+        "mkt_dist50": mclose / msma50 - 1,
+        "mkt_vol20": mret1.rolling(20).std(),
+        "regime": np.select(
+            [
+                mclose > msma50 * 1.005,
+                mclose < msma50 * 0.995
+            ],
+            [1.0, -1.0],
+            default=0.0
+        )
+    }, index=s.index)
+
     for h in HORIZONS:
-        f[f"ret{h}_fwd"]=c.shift(-h)/c-1; f[f"y{h}"]=(f[f"ret{h}_fwd"]>0).astype(float)
-    return f.replace([np.inf,-np.inf],np.nan)
+        f[f"ret{h}_fwd"] = close.shift(-h) / close - 1
+        f[f"y{h}"] = (f[f"ret{h}_fwd"] > 0).astype(float)
 
-def normalize_ticker(x):
-    x=str(x).strip().upper()
-    return x if x.endswith(".NS") else x+".NS"
+    return f.replace([np.inf, -np.inf], np.nan)
 
-def lexical(text):
-    pos={"beat","beats","strong","growth","upgrade","profit","surge","order","contract","bullish","positive","record","approval","wins","expansion","outperform"}
-    neg={"miss","misses","weak","loss","downgrade","fall","drop","decline","bearish","negative","probe","penalty","fraud","warning","delay","lawsuit","resign","cut","cuts"}
-    w=re.findall(r"[a-z]+",str(text).lower())
-    if not w:return 0.
-    return float(np.tanh((sum(x in pos for x in w)-sum(x in neg for x in w))/3))
 
-def load_news():
-    if not NEWS_FILE.exists():
-        print("\nHISTORICAL NEWS: NOT FOUND — QUANT-ONLY BACKTEST")
-        return pd.DataFrame()
-    n=pd.read_csv(NEWS_FILE)
-    req={"ticker","published_at","title"}
-    miss=req-set(n.columns)
-    if miss:raise RuntimeError(f"Historical news file missing columns: {sorted(miss)}")
-    n=n.copy(); n.ticker=n.ticker.map(normalize_ticker)
-    n.published_at=pd.to_datetime(n.published_at,errors="coerce",utc=True).dt.tz_convert(None)
-    n=n.dropna(subset=["ticker","published_at"]); n.title=n.title.fillna("").astype(str)
-    if "summary" not in n:n["summary"]=""
-    n.summary=n.summary.fillna("").astype(str)
-    text=n.title+" "+n.summary
-    supplied="gemini_score" in n.columns
-    n["gemini_score"]=pd.to_numeric(n["gemini_score"],errors="coerce") if supplied else text.map(lexical)
-    n["gemini_confidence"]=pd.to_numeric(n["gemini_confidence"],errors="coerce") if "gemini_confidence" in n else .50
-    n["gemini_score"]=n.gemini_score.clip(-1,1).fillna(0); n["gemini_confidence"]=n.gemini_confidence.clip(0,1).fillna(.50)
-    print(f"\nHISTORICAL NEWS: {len(n)} events")
-    print("Gemini historical scores detected." if supplied else "No Gemini scores; deterministic lexical fallback.")
-    return n.sort_values("published_at")
 
-def news_at(n,ticker,date):
-    z={k:0. for k in NEWS}
-    if n.empty:return z
-    d=pd.Timestamp(date); q=n[(n.ticker==ticker)&(n.published_at<=d)&(n.published_at>=d-pd.Timedelta(days=NEWS_LOOKBACK_DAYS))&(n.gemini_confidence>=NEWS_MIN_CONFIDENCE)].copy()
-    if q.empty:return z
-    age=(d-q.published_at).dt.total_seconds()/86400; w=np.exp(-age/NEWS_DECAY_DAYS)
-    sc=q.gemini_score.values; cf=q.gemini_confidence.values; ws=sc*cf*w; den=np.sum(cf*w)
-    return {"news_score":float(ws.sum()/den if den else 0),"news_confidence":float(np.average(cf,weights=w)),
-            "news_count":float(len(q)),"news_positive_share":float((q.gemini_score>.15).mean()),
-            "news_negative_share":float((q.gemini_score<-.15).mean()),
-            "news_weighted_score":float(np.tanh(ws.sum()/max(w.sum(),1e-9))),
-            "news_recency":float(np.exp(-age.min()/NEWS_DECAY_DAYS))}
 
-def attach_news(d,n):
-    vals=[news_at(n,r.ticker,r.date) for r in d[["ticker","date"]].itertuples(index=False)]
-    nf=pd.DataFrame(vals,index=d.index)
-    for c in NEWS:d[c]=nf[c].astype(float)
-    return d
+def build(n):
+    market = download("^NSEI")
+    if market.empty:
+        raise RuntimeError("Unable to download NIFTY (^NSEI).")
+
+    rows = []
+    successful = 0
+
+    for i, sym in enumerate(SYMBOLS, 1):
+        print(f"Loading [{i}/{len(SYMBOLS)}] {sym}")
+
+        try:
+            stock = download(sym)
+
+            if stock.empty or len(stock) < MIN_HISTORY:
+                print(
+                    f"WARNING: insufficient history for {sym}; skipping."
+                )
+                continue
+
+            feat = features(stock, market)
+            market_aligned = market.reindex(feat.index).ffill()
+
+            successful += 1
+
+            last = len(feat) - max(HORIZONS)
+
+            for j in range(MIN_HISTORY - 1, last):
+                row = feat.iloc[j]
+
+                if row[QUANT].isna().any():
+                    continue
+
+                record = {
+                    "ticker": sym,
+                    "date": feat.index[j],
+                    # IMPORTANT: bracket indexing, never Series.Close.
+                    "close": float(stock["Close"].iloc[j]),
+                    "market_close":
+                        float(market_aligned["Close"].iloc[j])
+                }
+
+                for col in QUANT:
+                    record[col] = float(row[col])
+
+                for h in HORIZONS:
+                    record[f"ret{h}_fwd"] = float(row[f"ret{h}_fwd"])
+                    record[f"y{h}"] = float(row[f"y{h}"])
+
+                rows.append(record)
+
+        except Exception as exc:
+            print(f"WARNING: {sym} failed: {exc}")
+
+    if not rows:
+        raise RuntimeError(
+            "No observations were created. "
+            "All ticker downloads/features failed."
+        )
+
+    data = pd.DataFrame(rows)
+
+    required = {"date", "ticker"}
+    missing = required - set(data.columns)
+    if missing:
+        raise RuntimeError(
+            f"Dataset construction failed; missing columns: {sorted(missing)}"
+        )
+
+    data = data.sort_values(
+        by=["date", "ticker"],
+        kind="mergesort"
+    ).reset_index(drop=True)
+
+    return attach_news(data, n), successful
+
+
 
 def leakage_check():
     if set(QUANT)&TARGETS or set(HYBRID)&TARGETS:raise RuntimeError("FATAL FEATURE/TARGET LEAKAGE")
@@ -285,29 +432,73 @@ def nonoverlap(d,n,h):
     return pd.DataFrame([{"top_n":n,"horizon":h,"trades":len(x),"win_rate":(x>0).mean(),"average_net_return":x.mean(),
                           "median_net_return":x.median(),"best":x.max(),"worst":x.min(),"sum_net_return":x.sum()}])
 
-def build(n):
+
     m=download("^NSEI")
-    if m.empty:raise RuntimeError("Unable to download NIFTY")
-    rows=[]; ok=0
+    if m.empty:
+        raise RuntimeError("Unable to download NIFTY")
+
+    rows=[]
+    ok=0
+
     for i,sym in enumerate(SYMBOLS,1):
         print(f"Loading [{i}/{len(SYMBOLS)}] {sym}")
         try:
             s=download(sym)
+
             if s.empty or len(s)<MIN_HISTORY:
-                print(f"WARNING: insufficient history for {sym}; skipping.");continue
-            f=features(s,m);ok+=1
+                print(f"WARNING: insufficient history for {sym}; skipping.")
+                continue
+
+            f=features(s,m)
+            market_aligned=m.reindex(f.index).ffill()
+            ok+=1
+
             for j in range(MIN_HISTORY-1,len(f)-max(HORIZONS)):
                 x=f.iloc[j]
-                if x[QUANT].isna().any():continue
-                r={"ticker":sym,"date":f.index[j],"close":float(x.Close),"market_close":float(x.market_close)}
-                for c in QUANT:r[c]=float(x[c])
-                for h in HORIZONS:r[f"ret{h}_fwd"]=float(x[f"ret{h}_fwd"]);r[f"y{h}"]=float(x[f"y{h}"])
+                if x[QUANT].isna().any():
+                    continue
+
+                signal_date=f.index[j]
+
+                r={
+                    "ticker":sym,
+                    "date":signal_date,
+                    "close":float(s["Close"].iloc[j]),
+                    "market_close":float(market_aligned["Close"].iloc[j])
+                }
+
+                for c in QUANT:
+                    r[c]=float(x[c])
+
+                for h in HORIZONS:
+                    r[f"ret{h}_fwd"]=float(x[f"ret{h}_fwd"])
+                    r[f"y{h}"]=float(x[f"y{h}"])
+
                 rows.append(r)
-        except Exception as e:print(f"WARNING: {sym} failed: {e}")
-    d=pd.DataFrame(rows).sort_values(["date","ticker"]).reset_index(drop=True)
+
+        except Exception as e:
+            print(f"WARNING: {sym} failed: {e}")
+
+    if not rows:
+        raise RuntimeError(
+            "No valid market observations were built. "
+            "Check yfinance output and OHLCV normalization."
+        )
+
+    d=pd.DataFrame(rows)
+    d=d.sort_values(["date","ticker"]).reset_index(drop=True)
+
     return attach_news(d,n),ok
 
+
 def run_backtest():
+    print("V6.5-FINAL-OHLCV-FIX")
+    print("yfinance version:", YF_VERSION)
+    print("V6.5 source revision: 2026-08-31-FINAL-OHLCV-FIX")
+    print("yfinance version:",getattr(yf,"__version__","unknown"))
+
+    print(f"V6.5 source revision: 2026-08-31-fix2")
+    print(f"yfinance version: {YF_VERSION}")
     news=load_news(); d,ok=build(news); leakage_check()
     dev,val,oos,vs,osd=split(d)
     print(f"\nTotal candidate observations: {len(d)}\nSuccessful symbols: {ok}\nUnique symbols: {d.ticker.nunique()}\nUnique signal dates: {d.date.nunique()}")
