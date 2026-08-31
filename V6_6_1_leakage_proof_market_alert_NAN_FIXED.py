@@ -69,8 +69,8 @@ warnings.filterwarnings("ignore")
 # CONFIG
 # ============================================================
 
-VERSION = "V6.6.1"
-REVISION = "2026-08-31-NAN-FIX2-STABLE"
+VERSION = "V6.6.2"
+REVISION = "2026-08-31-NAN-FIX2-THRESHOLD-FIX"
 
 YEARS = 6
 RANDOM_STATE = 42
@@ -84,8 +84,8 @@ RETRAIN_EVERY = 20
 
 HORIZONS = [1, 3, 5, 10]
 
-TRADE_P_THRESHOLD = 0.55
-TRADE_RETURN_THRESHOLD = 0.0020
+TRADE_P_THRESHOLD_THRESHOLD = 0.55
+TRADE_RETURN_THRESHOLDETURN_THRESHOLD = 0.0020
 
 GEMINI_WEIGHTS = [
     0.00,
@@ -1331,14 +1331,14 @@ def select_gemini_weight(
                 candidate[
                     "hybrid_probability"
                 ]
-                >= TRADE_P
+                >= TRADE_P_THRESHOLD
             )
             &
             (
                 candidate[
                     "hybrid_return"
                 ]
-                >= TRADE_R
+                >= TRADE_RETURN_THRESHOLD
             )
         ]
 
@@ -1441,11 +1441,11 @@ def performance(
 
     selected = q[
         (
-            p >= TRADE_P
+            p >= TRADE_P_THRESHOLD
         )
         &
         (
-            r >= TRADE_R
+            r >= TRADE_RETURN_THRESHOLD
         )
     ]
 
@@ -1658,12 +1658,12 @@ def nonoverlap(
     q = df[
         (
             df[probability_col]
-            >= TRADE_P
+            >= TRADE_P_THRESHOLD
         )
         &
         (
             df[return_col]
-            >= TRADE_R
+            >= TRADE_RETURN_THRESHOLD
         )
     ].copy()
 
@@ -1787,12 +1787,12 @@ def portfolio_test(
     q = df[
         (
             df[probability_col]
-            >= TRADE_P
+            >= TRADE_P_THRESHOLD
         )
         &
         (
             df[return_col]
-            >= TRADE_R
+            >= TRADE_RETURN_THRESHOLD
         )
     ].copy()
 
@@ -2140,13 +2140,13 @@ def yearly_stability(
             (
                 g[
                     probability_col
-                ] >= TRADE_P
+                ] >= TRADE_P_THRESHOLD
             )
             &
             (
                 g[
                     return_col
-                ] >= TRADE_R
+                ] >= TRADE_RETURN_THRESHOLD
             )
         ].copy()
 
@@ -2294,13 +2294,13 @@ def regime_stability(
             (
                 g[
                     probability_col
-                ] >= TRADE_P
+                ] >= TRADE_P_THRESHOLD
             )
             &
             (
                 g[
                     return_col
-                ] >= TRADE_R
+                ] >= TRADE_RETURN_THRESHOLD
             )
         ]
 
