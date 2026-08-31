@@ -1,5 +1,5 @@
 numpy>=1.26,<3
 pandas>=2.2,<3
-yfinance>=0.2.50
+yfinance>=0.2.66,<1
 scikit-learn>=1.5,<2
 requests>=2.31,<3
