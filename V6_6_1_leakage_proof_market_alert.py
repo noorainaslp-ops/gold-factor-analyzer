@@ -211,6 +211,34 @@ QUANT_FEATURES = [
 # HELPERS
 # ============================================================
 
+
+# ---------------------------------------------------------------------------
+# V6.6.1-NAN-FIX
+# All model feature matrices are forced finite before sklearn fitting.
+# No target/forward-return field is used for imputation.
+# ---------------------------------------------------------------------------
+def _finite_features(X):
+    import numpy as _np
+    import pandas as _pd
+    if isinstance(X, _pd.DataFrame):
+        Z = X.copy()
+        for c in Z.columns:
+            Z[c] = _pd.to_numeric(Z[c], errors="coerce")
+        Z = Z.replace([_np.inf, -_np.inf], _np.nan)
+        med = Z.median(axis=0, skipna=True)
+        return Z.fillna(med).fillna(0.0).astype(float)
+    A = _np.asarray(X, dtype=float)
+    A = _np.where(_np.isfinite(A), A, _np.nan)
+    if A.ndim == 1:
+        vals = A[_np.isfinite(A)]
+        fill = float(_np.median(vals)) if vals.size else 0.0
+        return _np.where(_np.isfinite(A), A, fill)
+    for j in range(A.shape[1]):
+        vals = A[:, j][_np.isfinite(A[:, j])]
+        fill = float(_np.median(vals)) if vals.size else 0.0
+        A[~_np.isfinite(A[:, j]), j] = fill
+    return A
+
 def sigmoid(x):
     return 1.0 / (
         1.0 + np.exp(-np.clip(x, -30, 30))
@@ -952,21 +980,25 @@ def fit_model(
         random_state=RANDOM_STATE,
     )
 
+    X_train = _finite_features(X_train)
     clf1.fit(
         X,
         y_direction
     )
 
+    X_train = _finite_features(X_train)
     clf2.fit(
         X,
         y_direction
     )
 
+    X_train = _finite_features(X_train)
     reg1.fit(
         X,
         y_return
     )
 
+    X_train = _finite_features(X_train)
     reg2.fit(
         X,
         y_return
