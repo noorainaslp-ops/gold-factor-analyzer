@@ -1,0 +1,64 @@
+name: V6.6 Point-in-Time Gemini Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Show files
+        run: |
+          echo 'Root:'
+          ls -la
+          echo 'Data:'
+          ls -la data || true
+
+      - name: Check historical news
+        id: news
+        shell: bash
+        run: |
+          if [ -f data/historical_news_raw.csv ]; then
+            echo 'has_raw=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'has_raw=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Score historical news with Gemini
+        if: steps.news.outputs.has_raw == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: gemini-2.5-flash
+          GEMINI_RAW_NEWS_FILE: data/historical_news_raw.csv
+          GEMINI_OUTPUT_FILE: data/historical_gemini.csv
+        run: |
+          python V6_6_gemini_historical_scorer.py
+
+      - name: Run V6.6 backtest
+        run: |
+          python V6_6_point_in_time_backtest.py
+
+      - name: Upload audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: V6.6-audit
+          path: audit/
+          if-no-files-found: error
+          retention-days: 30
