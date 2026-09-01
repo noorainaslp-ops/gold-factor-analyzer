@@ -16,7 +16,7 @@ try:
 except Exception as e:
  print('FATAL import error:',e); sys.exit(1)
 
-VERSION='V7.1'; REVISION='2026-09-01-POINT-IN-TIME-RESEARCH-UPGRADE'
+VERSION='V7.1.1'; REVISION='2026-09-01-SKLEARN-1.8-COMPATIBILITY-FIX'
 COST=.003; RANDOM_STATE=42; PURGE_DAYS=10; MIN_TRAIN=2500
 HORIZONS=[1,3,5,10]; PRIMARY_HORIZON=10
 PROB_GRID=[.50,.55,.60,.65,.70]; RETURN_GRID=[0,.002,.004,.006]
@@ -118,7 +118,7 @@ def splits(d):
  return d[d.date<a].copy(),d[(d.date>=a)&(d.date<b)].copy(),d[d.date>=b].copy(),pd.Timestamp(a),pd.Timestamp(b)
 
 def models():
- return (Pipeline([('imp',SimpleImputer(strategy='median',add_indicator=True)),('sc',StandardScaler()),('m',LogisticRegression(C=.35,max_iter=1500,class_weight='balanced',random_state=RANDOM_STATE))]),HistGradientBoostingClassifier(max_iter=180,learning_rate=.045,max_leaf_nodes=15,l2_regularization=1,random_state=RANDOM_STATE),Pipeline([('imp',SimpleImputer(strategy='median',add_indicator=True)),('sc',StandardScaler()),('m',Ridge(alpha=8))]),HistGradientBoostingRegressor(max_iter=180,learning_rate=.045,max_leaf_nodes=15,l2_regularization=1,loss='huber',random_state=RANDOM_STATE))
+ return (Pipeline([('imp',SimpleImputer(strategy='median',add_indicator=True)),('sc',StandardScaler()),('m',LogisticRegression(C=.35,max_iter=1500,class_weight='balanced',random_state=RANDOM_STATE))]),HistGradientBoostingClassifier(max_iter=180,learning_rate=.045,max_leaf_nodes=15,l2_regularization=1,random_state=RANDOM_STATE),Pipeline([('imp',SimpleImputer(strategy='median',add_indicator=True)),('sc',StandardScaler()),('m',Ridge(alpha=8))]),HistGradientBoostingRegressor(max_iter=180,learning_rate=.045,max_leaf_nodes=15,l2_regularization=1,loss='squared_error',random_state=RANDOM_STATE))
 
 def fit(train,h):
  q=train.dropna(subset=[f'future_return_{h}']);
