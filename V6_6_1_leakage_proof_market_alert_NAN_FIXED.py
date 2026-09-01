@@ -141,7 +141,10 @@ def wf(train_pool,test,h):
  return pd.concat(out,ignore_index=True) if out else pd.DataFrame()
 
 def addblend(q,w=0):
- z=q.copy();z['gemini_available']=z.gemini_score.notna().astype(int);z['blend_probability']=z.quant_probability;z['blend_return_prediction']=z.quant_return_prediction;ok=z.gemini_available.eq(1)
+ z=q.copy();
+ g=z.loc[:, 'gemini_score'] if 'gemini_score' in z.columns else pd.Series(np.nan,index=z.index);
+ if isinstance(g,pd.DataFrame):g=g.iloc[:,0];
+ z['gemini_available']=g.notna().astype(int);z['blend_probability']=z.quant_probability;z['blend_return_prediction']=z.quant_return_prediction;ok=z['gemini_available'].eq(1)
  if w>0 and ok.any():
   z.loc[ok,'blend_probability']=(1-w)*z.loc[ok,'quant_probability']+w*z.loc[ok,'gemini_score']; r=z.loc[ok,'gemini_return'];have=r.notna();idx=r.index[have];z.loc[idx,'blend_return_prediction']=(1-w)*z.loc[idx,'quant_return_prediction']+w*r.loc[idx]
  return z
@@ -158,7 +161,12 @@ def thresholds(v,h):
  return best or {'pmin':.55,'rmin':.002,'n':0,'avg':np.nan,'win_rate':np.nan,'profit_factor':np.nan,'score':-np.inf}
 
 def weight(v,h,th):
- if v.gemini_available.sum()<max(50,int(len(v)*MIN_GEMINI_COVERAGE)):return 0
+ # Robust to duplicate/missing helper columns: derive availability directly from the point-in-time Gemini score.
+ if 'gemini_score' not in v.columns:return 0
+ g=v.loc[:, 'gemini_score']
+ if isinstance(g,pd.DataFrame):g=g.iloc[:,0]
+ available=g.notna()
+ if int(available.sum())<max(50,int(len(v)*MIN_GEMINI_COVERAGE)):return 0
  best=(0,-np.inf)
  for w in GEMINI_WEIGHT_GRID:
   q=addblend(v,w);q=q[(q.blend_probability>=th['pmin'])&(q.blend_return_prediction>=th['rmin'])].dropna(subset=[f'exec_return_{h}']);
